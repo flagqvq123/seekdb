@@ -52,7 +52,29 @@ import time
 from pathlib import Path
 
 DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+DEFAULT_TEST_ROOT_DIR = ".tmp"
 EOF = object()
+
+
+def test_root():
+    """Return the directory that holds all test data directories.
+
+    The session sandbox may forbid child processes from writing outside the
+    workspace (for example Windows %TEMP%), so the default lives inside the
+    repository. Set MVDB_TEST_ROOT to override it; the directory is created.
+    """
+    override = os.environ.get("MVDB_TEST_ROOT")
+    if override:
+        root = Path(override).expanduser()
+    else:
+        root = Path(__file__).resolve().parents[2] / DEFAULT_TEST_ROOT_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def make_workdir(prefix):
+    """Create an isolated temporary work directory under test_root()."""
+    return tempfile.mkdtemp(prefix=prefix, dir=str(test_root()))
 
 
 class ProtocolError(RuntimeError):
@@ -561,7 +583,7 @@ def _cli(argv=None):
     if not Path(binary).exists():
         parser.error(f"binary does not exist: {binary}")
 
-    root = Path(tempfile.mkdtemp(prefix="mvdb-client-"))
+    root = Path(make_workdir("mvdb-client-"))
     data_dir = Path(args.data_dir) if args.data_dir else root / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     stderr_log = root / "stderr.log"

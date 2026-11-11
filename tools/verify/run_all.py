@@ -40,7 +40,14 @@ ROOT = HERE.parents[1]  # seekdb/
 PACKAGE = ROOT / "mysqltest"
 CONFIG_PATH = ROOT / "protocol_check" / "config.json"
 sys.path.insert(0, str(HERE))
-from jsonl_client import ClientTimeout, ProtocolError, Session, strict_json  # noqa: E402
+from jsonl_client import (  # noqa: E402
+    ClientTimeout,
+    ProtocolError,
+    Session,
+    make_workdir,
+    strict_json,
+    test_root,
+)
 
 DEFAULT_STARTUP_TIMEOUT = 120.0
 DEFAULT_REQUEST_TIMEOUT = 60.0
@@ -156,7 +163,7 @@ def session_stderr_suffix(session):
 
 
 def run_handshake(binary, args):
-    work = tempfile.mkdtemp(prefix="mvdb-handshake-")
+    work = make_workdir("mvdb-handshake-")
     data = os.path.join(work, "data")
     os.makedirs(data)
     session = None
@@ -195,7 +202,7 @@ def run_handshake(binary, args):
 
 
 def run_public_case(case, config, binary, args):
-    work = tempfile.mkdtemp(prefix="mvdb-public-")
+    work = make_workdir("mvdb-public-")
     data = os.path.join(work, "data")
     os.makedirs(data)
     session = None
@@ -265,7 +272,7 @@ def run_public_case(case, config, binary, args):
 
 
 def run_edge_suite(binary, args):
-    report_path = Path(tempfile.mkdtemp(prefix="mvdb-edge-report-")) / "edge.json"
+    report_path = Path(make_workdir("mvdb-edge-report-")) / "edge.json"
     command = [
         sys.executable,
         str(HERE / "edge_cases.py"),
@@ -363,6 +370,7 @@ def main(argv=None):
     started = time.monotonic()
     print("MiniVectorDB one-command regression")
     print(f"binary: {binary}")
+    print(f"data root: {test_root()}")
     print("")
 
     handshake = None
@@ -438,6 +446,7 @@ def main(argv=None):
     if args.report:
         payload = {
             "binary": binary,
+            "test_root": str(test_root()),
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started)),
             "duration_ms": round((time.monotonic() - started) * 1000),
             "handshake": handshake,

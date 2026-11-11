@@ -45,7 +45,13 @@ import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from jsonl_client import ClientTimeout, ProtocolError, Session  # noqa: E402
+from jsonl_client import (  # noqa: E402
+    ClientTimeout,
+    ProtocolError,
+    Session,
+    make_workdir,
+    test_root,
+)
 
 ABS_TOL = 1e-5
 REL_TOL = 1e-5
@@ -265,7 +271,7 @@ class CaseResult:
 
 
 def run_case(case, binary, args):
-    work_dir = tempfile.mkdtemp(prefix="mvdb-edge-")
+    work_dir = make_workdir("mvdb-edge-")
     env = CaseEnv(
         binary, work_dir, args.startup_timeout, args.request_timeout, args.large_rows
     )
@@ -320,7 +326,7 @@ def print_failure(result):
 def protocol_handshake_execute_shutdown(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(session.execute("INSERT INTO t VALUES (1, 'a');"), 1, "insert")
@@ -379,7 +385,7 @@ def protocol_errors_continue_connection(env):
         "create table without primary key",
     )
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(session.execute("INSERT INTO t VALUES (1, 'a');"), 1, "insert")
@@ -701,7 +707,7 @@ def atomicity_transaction_failed_insert(env):
 def atomicity_transaction_failed_then_rollback(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(session.execute("INSERT INTO t VALUES (1, 'a');"), 1, "seed row")
@@ -726,7 +732,7 @@ def atomicity_transaction_failed_then_rollback(env):
 def atomicity_transaction_commit_rollback_visibility(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(session.execute("INSERT INTO t VALUES (1, 'orig');"), 1, "seed row")
@@ -894,7 +900,7 @@ def sql_order_by_ties_by_primary_key(env):
 def sql_limit_zero(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(
@@ -930,7 +936,7 @@ def sql_limit_zero(env):
 def sql_empty_table(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_rows(
@@ -995,7 +1001,7 @@ def sql_select_empty_result_columns(env):
 def sql_multiple_tables(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table a",
     )
     require_ok(
@@ -1003,7 +1009,7 @@ def sql_multiple_tables(env):
         "create table b",
     )
     require_ok(
-        session.execute("CREATE TABLE c (id BIGINT PRIMARY KEY, note VARCHAR(8));"),
+        session.execute("CREATE TABLE c (id BIGINT PRIMARY KEY, note VARCHAR(64));"),
         "create table c",
     )
     check_affected(session.execute("INSERT INTO a VALUES (1, 'a1');"), 1, "insert a")
@@ -1181,7 +1187,7 @@ def durability_restart_preserves_mutations(env):
 def durability_crash_committed_survives(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(session.execute("INSERT INTO t VALUES (1, 'kept');"), 1, "insert")
@@ -1200,7 +1206,7 @@ def durability_crash_committed_survives(env):
 def durability_crash_deleted_stays_deleted(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(
@@ -1222,7 +1228,7 @@ def durability_crash_deleted_stays_deleted(env):
 def durability_crash_uncommitted_txn_absent(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(session.execute("INSERT INTO t VALUES (1, 'committed');"), 1, "committed insert")
@@ -1273,7 +1279,7 @@ def durability_crash_multiple_recoveries(env):
 def durability_crash_immediately_after_ready(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(session.execute("INSERT INTO t VALUES (1, 'kept');"), 1, "insert")
@@ -1295,7 +1301,7 @@ def durability_crash_immediately_after_ready(env):
 def durability_shutdown_rolls_back_uncommitted(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(session.execute("INSERT INTO t VALUES (1, 'committed');"), 1, "committed insert")
@@ -1316,7 +1322,7 @@ def durability_shutdown_rolls_back_uncommitted(env):
 def durability_restart_multiple_tables(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table a",
     )
     require_ok(
@@ -1408,7 +1414,7 @@ def vector_filtered_topk_is_filter_first(env):
     session = env.open()
     require_ok(
         session.execute(
-            "CREATE TABLE ft (id BIGINT PRIMARY KEY, category VARCHAR(8), embedding VECTOR(2));"
+            "CREATE TABLE ft (id BIGINT PRIMARY KEY, category VARCHAR(64), embedding VECTOR(2));"
         ),
         "create table",
     )
@@ -1451,7 +1457,7 @@ def vector_filtered_topk_is_filter_first(env):
     # Equal distances are broken by ascending primary key.
     require_ok(
         session.execute(
-            "CREATE TABLE ties (id BIGINT PRIMARY KEY, category VARCHAR(8), embedding VECTOR(2));"
+            "CREATE TABLE ties (id BIGINT PRIMARY KEY, category VARCHAR(64), embedding VECTOR(2));"
         ),
         "create ties table",
     )
@@ -1480,7 +1486,7 @@ def vector_index_maintenance_live(env):
     session = env.open()
     require_ok(
         session.execute(
-            "CREATE TABLE docs (id BIGINT PRIMARY KEY, category VARCHAR(8), embedding VECTOR(2));"
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, category VARCHAR(64), embedding VECTOR(2));"
         ),
         "create docs",
     )
@@ -1700,7 +1706,7 @@ def spec_string_compare_by_code_point(env):
 def durability_commit_ack_then_crash(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     require_ok(session.execute("BEGIN;"), "begin")
@@ -1723,7 +1729,7 @@ def durability_commit_ack_then_crash(env):
 def durability_autocommit_ack_then_crash(env):
     session = env.open()
     require_ok(
-        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(8));"),
+        session.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(64));"),
         "create table",
     )
     check_affected(
@@ -1786,7 +1792,7 @@ def durability_index_maintenance_restart_ann(env):
     session = env.open()
     require_ok(
         session.execute(
-            "CREATE TABLE docs (id BIGINT PRIMARY KEY, category VARCHAR(8), embedding VECTOR(2));"
+            "CREATE TABLE docs (id BIGINT PRIMARY KEY, category VARCHAR(64), embedding VECTOR(2));"
         ),
         "create docs",
     )
@@ -2035,6 +2041,7 @@ def write_report(path, binary, results, started):
     payload = {
         "suite": "minivectordb-hidden-case-hardening",
         "binary": binary,
+        "test_root": str(test_root()),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started)),
         "duration_ms": round((time.monotonic() - started) * 1000),
         "groups": groups,
@@ -2109,6 +2116,7 @@ def main(argv=None):
     started = time.monotonic()
     print("MiniVectorDB hidden-case hardening suite")
     print(f"binary: {binary}")
+    print(f"data root: {test_root()}")
     print(f"cases: {len(selected)}")
     print("")
 
