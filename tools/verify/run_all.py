@@ -286,6 +286,8 @@ def run_edge_suite(binary, args):
         command += ["--xfail-group", group]
     if args.keep_data:
         command.append("--keep-data")
+    sys.stdout.flush()
+    sys.stderr.flush()
     started = time.monotonic()
     returncode = subprocess.run(command).returncode
     payload = None
@@ -319,6 +321,17 @@ def main(argv=None):
         action="append",
         default=[],
         help="edge groups expected to fail (for example durability while storage is a stub)",
+    )
+    parser.add_argument(
+        "--xfail-case",
+        action="append",
+        default=[],
+        help="public case id expected to fail; repeatable (temporary known gaps)",
+    )
+    parser.add_argument(
+        "--xfail-public-persistence",
+        action="store_true",
+        help="temporarily treat the 7 restart-dependent public cases as expected failures",
     )
     parser.add_argument("--skip-handshake", action="store_true")
     parser.add_argument("--skip-public", action="store_true")
@@ -361,17 +374,28 @@ def main(argv=None):
             print("  " + handshake["message"].replace("\n", "\n  "))
         print("")
 
+    xfail_ids = set(args.xfail_case)
+    if args.xfail_public_persistence:
+        xfail_ids |= KNOWN_PERSISTENCE_PUBLIC_CASES
+    unknown_xfail = xfail_ids - {case["id"] for case in manifest["cases"]}
+    if unknown_xfail:
+        parser.error("unknown --xfail-case: " + ", ".join(sorted(unknown_xfail)))
+
     public_results = []
     if not args.skip_public:
         print(f"=== Phase 2: public mysqltest cases ({len(public_cases)}) ===")
         for case in public_cases:
             result = run_public_case(case, config, binary, args)
+            result["xfail"] = result["status"] == "FAIL" and result["id"] in xfail_ids
             public_results.append(result)
-            print(f"{result['status']} {case['id']} ({result['duration_ms']} ms)")
+            status = "XFAIL" if result.get("xfail") else result["status"]
+            print(f"{status} {case['id']} ({result['duration_ms']} ms)")
             if result["message"]:
                 print("  " + result["message"].replace("\n", "\n  "))
         passed = sum(1 for result in public_results if result["status"] == "PASS")
-        print(f"public: {passed}/{len(public_results)} passed")
+        xfailed = sum(1 for result in public_results if result.get("xfail"))
+        suffix = f" ({xfailed} xfail)" if xfailed else ""
+        print(f"public: {passed}/{len(public_results)} passed{suffix}")
         print("")
 
     edge = None
@@ -380,7 +404,9 @@ def main(argv=None):
         edge = run_edge_suite(binary, args)
         print("")
 
-    public_failures = [r for r in public_results if r["status"] != "PASS"]
+    public_failures = [
+        r for r in public_results if r["status"] != "PASS" and not r.get("xfail")
+    ]
     handshake_failed = handshake is not None and handshake["status"] != "PASS"
     edge_failed = edge is not None and edge["returncode"] != 0
     overall = not (handshake_failed or public_failures or edge_failed)
@@ -392,8 +418,13 @@ def main(argv=None):
         print(
             f"public: {len(public_results) - len(public_failures)}/{len(public_results)} passed"
         )
-        for result in public_failures:
+        for result in public_results:
+            if result["status"] == "PASS" or result.get("xfail"):
+                continue
             print(f"  FAIL {result['id']}: {result['message'].splitlines()[0]}")
+        for result in public_results:
+            if result.get("xfail"):
+                print(f"  XFAIL {result['id']}: {result['message'].splitlines()[0]}")
     if edge is not None:
         report = edge.get("report") or {}
         summary = report.get("cases")

@@ -26,15 +26,31 @@ pub fn coerce_to_column(ty: &ColType, value: Value, column: &str) -> DbResult<Va
                 format!("cannot store {:?} into BIGINT column {}", other, column),
             )),
         },
-        ColType::Varchar(_) => match value {
-            Value::Str(s) => Ok(Value::Str(s)),
-            Value::Int(v) => Ok(Value::Str(v.to_string())),
-            Value::Float(f) => Ok(Value::Str(f.to_string())),
-            other => Err(DbError::new(
-                crate::types::ERR_TYPE_MISMATCH,
-                format!("cannot store {:?} into VARCHAR column {}", other, column),
-            )),
-        },
+        ColType::Varchar(limit) => {
+            let text = match value {
+                Value::Str(s) => s,
+                Value::Int(v) => v.to_string(),
+                Value::Float(f) => f.to_string(),
+                other => {
+                    return Err(DbError::new(
+                        crate::types::ERR_TYPE_MISMATCH,
+                        format!("cannot store {:?} into VARCHAR column {}", other, column),
+                    ))
+                }
+            };
+            // VARCHAR(n) counts Unicode scalar values, not bytes.
+            let chars = text.chars().count();
+            if chars > *limit as usize {
+                return Err(DbError::new(
+                    crate::types::ERR_STRING_TOO_LONG,
+                    format!(
+                        "value of {} characters exceeds VARCHAR({}) for column {}",
+                        chars, limit, column
+                    ),
+                ));
+            }
+            Ok(Value::Str(text))
+        }
         ColType::Vector(dim) => {
             let parsed = match value {
                 Value::Str(s) => crate::vector::parse_vector(&s)?,

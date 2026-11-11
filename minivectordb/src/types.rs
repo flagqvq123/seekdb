@@ -11,6 +11,7 @@ pub const ERR_TABLE_NOT_FOUND: &str = "table_not_found";
 pub const ERR_COLUMN_NOT_FOUND: &str = "column_not_found";
 pub const ERR_TYPE_MISMATCH: &str = "type_mismatch";
 pub const ERR_TX_STATE: &str = "transaction_state";
+pub const ERR_STRING_TOO_LONG: &str = "string_too_long";
 pub const ERR_INTERNAL: &str = "internal_error";
 pub const ERR_IO: &str = "io_error";
 pub const ERR_RESPONSE_TOO_LARGE: &str = "response_too_large";

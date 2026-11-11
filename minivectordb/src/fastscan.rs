@@ -681,7 +681,10 @@ mod tests {
             assert_distances_close(&got, &want);
 
             let got_f64 = scan_topk_indices_f64(&vectors, &ids, 8, &query, 10, &candidates);
-            assert_same_ids(&got, &want);
+            assert_same_ids(
+                &got_f64.iter().map(|(id, distance)| (*id, *distance as f32)).collect::<Vec<_>>(),
+                &want,
+            );
         }
     }
 
