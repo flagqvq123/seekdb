@@ -1,0 +1,110 @@
+{
+  "meta": {
+    "format": "agent-learning-evidence-v3-unbounded",
+    "project": "OceanBase/seekdb 2026 MiniVectorDB (Round2)",
+    "branch": "2026-competition-round2",
+    "commit_sha": "TODO_FILL_WITH_40_CHAR_SHA_AFTER_SUBMISSION_COMMIT",
+    "prepared_by": "agent-team (harness)",
+    "created_utc": "2026-11-11T13:20:00Z",
+    "material_status": "SKELETON_ONLY",
+    "synthetic": false,
+    "language": "zh-CN"
+  },
+  "disclaimer": [
+    "本文件目前只是结构骨架：所有标注 TODO 的 student_evidence / result_evidence 字段都必须由用户（学生）填入真实材料后才能作为评分证据。",
+    "请勿把本骨架中的占位文本当作学生贡献；本次由 agent 创建骨架的行为本身不是学生证据。",
+    "verified_tool_results 是 agent 在本地实际执行得到的事实记录，只作为上下文，不替代学生证据。",
+    "提交前必须：UTF-8、合法 JSON 对象、<= 128 KiB、无重复键、无密钥/token。"
+  ],
+  "instructions_for_filling": [
+    "把真实的用户 prompt 原文放入 user_prompts[].content（字符串字段），保留必要的上下文与来源标注。",
+    "学生自己的分析、预测、验证、修正与复测放入 conversations / experiments，区分学生发言与 agent 输出。",
+    "experiments[].output 必须是实际执行结果原文片段；未执行的内容明确标记为 planned，不得写成已验证。",
+    "引用证据时使用 RFC6901 JSON pointer 指向本文件内的字符串字段，并附不超过 240 字符的精确原文。",
+    "同一证据不要跨实例/跨维度重复计分；按问题-实验-修正链组织独立实例。",
+    "不要编造交互或实验结果；可以脱敏，但保留判断所需上下文。"
+  ],
+  "user_prompts": [
+    {
+      "id": "prompt-001",
+      "source": "student",
+      "status": "TODO",
+      "content": "TODO(student): 粘贴今晚真实的学生 prompt 原文（例如对任务目标、约束或方案的表述）",
+      "context": "TODO(student): 该 prompt 发生的时间、当时已知信息与目标",
+      "notes": "占位，待填真实材料后删除 status=TODO"
+    }
+  ],
+  "conversations": [
+    {
+      "id": "conv-001",
+      "status": "TODO",
+      "pointer": "/user_prompts/0/content",
+      "entries": [
+        {
+          "seq": 0,
+          "role": "student",
+          "content": "TODO(student): 真实发言原文",
+          "evidence_dimension": "TODO(student): 从五个评价维度中选择最相关的一个"
+        },
+        {
+          "seq": 1,
+          "role": "agent",
+          "content": "TODO(student): 保留必要的 agent 回复上下文（不作为学生证据）"
+        }
+      ]
+    }
+  ],
+  "experiments": [
+    {
+      "id": "exp-001",
+      "status": "TODO(planned)",
+      "question": "TODO(student): 想验证的具体问题或预测",
+      "command": "TODO(student): 实际执行的命令",
+      "output": "TODO(student): 实际输出片段（未执行则标记 planned，不得伪造）",
+      "student_interpretation": "TODO(student): 对结果的解释、据此做出的修正与复测结果",
+      "result_evidence_pointer": "TODO: /experiments/0/output"
+    }
+  ],
+  "verified_tool_results": [
+    {
+      "id": "tool-001",
+      "recorded_utc": "2026-11-11T13:16:17Z",
+      "source": "agent_tool_execution",
+      "usable_as": "context_only_not_student_evidence",
+      "command": "python tools/verify/clean_clone_check.py --ref HEAD --dockerfile Dockerfile --dockerignore .dockerignore",
+      "result": "PASS: committed tree exported via git archive; docker build context 384 bytes; entrypoint non-shell; non-root uid 10001:10001; STDIO_PROTOCOL section 7 sample (ready + CREATE/INSERT/SELECT + shutdown) passed under --read-only --network=none 2CPU/2GiB.",
+      "note": "Dockerfile ARG scoping bug was found and fixed by this check before commit."
+    },
+    {
+      "id": "tool-002",
+      "recorded_utc": "2026-11-11T13:16:47Z",
+      "source": "agent_tool_execution",
+      "usable_as": "context_only_not_student_evidence",
+      "command": "python tools/verify/submission_lint.py --skip-build --skip-status --skip-public-cases",
+      "result": "conversation/tooling checks executed; expected FAIL rows were branch (round2-impl vs 2026-competition-round2) and head_files (conversation.json not committed yet).",
+      "note": "Used to design the submission checklist; not a substitute for real student evidence."
+    }
+  ],
+  "retrospective": {
+    "status": "TODO",
+    "notes": [
+      "TODO(student): 结合公开用例结果（例如 --restart 用例失败原因）解释自己的验证与取舍",
+      "TODO(student): 记录方案代价、失败原因、适用条件与局限"
+    ]
+  },
+  "limitations": [
+    "本骨架不包含学生真人证据，评审前必须由学生补全。",
+    "TODO(student): 补充本次提交的已知限制与未完成项"
+  ],
+  "submission_notes": {
+    "target_branch": "2026-competition-round2",
+    "required_same_commit": [
+      "minivectordb source",
+      "Dockerfile",
+      "agent/conversation.json"
+    ],
+    "max_bytes": 131072,
+    "runbook": "docs/COMPETITION_RUNBOOK.md",
+    "checklist": "docs/SUBMISSION_CHECKLIST.md"
+  }
+}

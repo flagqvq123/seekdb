@@ -1,18 +1,24 @@
-# DiskStorage WIP: durable WAL + checkpoint storage (task-1)
+# DiskStorage: durable WAL + checkpoint storage (task-1)
 
-Status as of 2026-11-11 20:10 (session cut short by shutdown).
+Status: IMPLEMENTED and validated (2026-11-11 21:30).
 
-- src/storage/format.rs is COMPLETE and self-contained (CRC32, record framing,
-  row/catalog/index/WAL encoders + decoders, unit tests). It is not yet declared
-  in src/storage/mod.rs, so cargo does not compile it yet. It is committed so the
-  next session can wire it in immediately.
-- src/storage/disk.rs is still the old delegate stub (crate compiles, cargo check
-  EXIT=0). The full implementation was designed and partially written but the
-  file write was rejected by the tooling at the end of the session, so nothing
-  half-finished was left on disk.
-- Next step (first thing next session): add 'mod format;' to src/storage/mod.rs
-  (needs Lead approval, mod.rs is Lead-owned), then implement disk.rs per below
-  and run cargo test.
+- src/storage/format.rs: on-disk encodings (complete).
+- src/storage/disk.rs: durable engine (complete).
+- Wired into the crate via src/storage/mod.rs (Lead).
+- cargo test: 55 passed, 0 failed, 2 ignored (all crate tests, including the
+  14 disk-storage tests and the 200k-row test).
+- WSL release build + official public cases: 20 / 20 PASS
+  (protocol-results/wsl-20261111-211451/result.json).
+- WSL hard-kill smoke test: rows acked by COMMIT survive SIGKILL; a SIGKILL
+  with an open transaction leaves the transaction rolled back; a garbage
+  WAL tail is truncated and later commits still replay; clean shutdown +
+  reopen is consistent.
+- WSL perf smoke (10k rows x 128 dims, 100 batches / 100 commits; then 200
+  filtered/unfiltered TopK K=10): write 1.35 s (~13.5 ms per 100-row commit
+  including SQL parsing), query 3.59 ms/query, /data 6 MB. Query time is
+  dominated by the engine's in-memory scan, not by storage reads.
+
+The chapter below is the implementation reference.
 
 ## Why this design (driven by COMPETITION_SPEC.md)
 
@@ -161,6 +167,43 @@ are suppressed by the merge, never by materialising the table.
 - MINIVECTORDB_CHECKPOINT_MIB: WAL size that forces a checkpoint (default 64).
   Committed row count threshold default 512k rows.
 
+## Validation evidence
+
+Unit tests in src/storage/disk.rs (all green):
+
+- fresh_directory_opens_empty: new data dir opens at generation 1.
+- reopen_restores_catalog_rows_and_index_metadata: catalog, row data and
+  vector-index metadata survive close and reopen.
+- commit_without_flush_survives_simulated_kill: drop without flush (hard kill
+  simulation) then reopen recovers every row from the WAL.
+- transaction_rollback_never_reaches_disk: rolled-back rows are absent after
+  reopen.
+- statement_rollback_keeps_earlier_transaction_writes: an aborted statement
+  only undoes its own writes, earlier statements still commit.
+- torn_wal_tail_is_truncated_and_later_commits_survive: a partial record at
+  the WAL tail is truncated on open, later commits append cleanly.
+- multiple_checkpoints_recover_with_updates_and_deletes: four checkpoints plus
+  an update and a delete recover to the exact visible set.
+- checkpoint_bounds_wal_growth: threshold-triggered checkpoints keep the WAL
+  small and all rows survive reopen.
+- stale_files_from_interrupted_checkpoint_are_ignored: leftover next-generation
+  and temp files do not affect recovery and are cleaned up.
+- get_and_scan_see_own_transaction_writes: read-your-writes in a transaction.
+- ddl_inside_transaction_rolls_back: a table created in a rolled-back
+  transaction never appears.
+- multiple_tables_persist_independently.
+- repeated_scans_use_the_row_cache: second scan is served from the cache.
+- large_table_write_scan_and_reopen: 200k rows written in one transaction,
+  scanned in pk order (streaming), checkpointed, reopened and rescanned.
+
+Official acceptance (WSL, release build):
+
+- bash minivectordb/tools/wsl_check.sh -> PASS 20 / 20 public cases.
+- Hard-kill smoke: acked commits survive SIGKILL; an open transaction is rolled
+  back; garbage WAL tail is truncated; clean shutdown and reopen agree.
+- Perf smoke: 10k rows x 128 dims, 100 batches / 100 commits = 1.35 s wall;
+  200 filtered/unfiltered TopK K=10 = 3.59 ms/query; /data = 6 MB.
+
 ## Known trade-offs / remaining work
 
 - Checkpoint rewrites the whole base. For the official 5-10 MB workload this is
@@ -169,19 +212,7 @@ are suppressed by the merge, never by materialising the table.
   considered but deliberately deferred: correctness first.
 - The row cache is FIFO, not LRU. Repeated full scans stay hot; pathological
   access patterns can evict useful rows.
+- A single transaction record is capped at 1 GiB; a larger commit fails cleanly
+  instead of being partially applied.
 - No asynchronous checkpointing, no per-table drop (SQL does not support DROP
   TABLE), no multi-process locking (single process by contest definition).
-- Unit tests still to be written in disk.rs: reopen restores catalog/rows/index
-  metadata; transaction and statement rollback across reopen; torn WAL tail
-  truncated (partial header and partial payload) and later commits still work;
-  several checkpoints with updates and deletes; WAL growth bounded by the
-  threshold; stale/interrupted-checkpoint files ignored on double reopen;
-  read-your-own-writes in a transaction; 200k-row write/scan/reopen.
-
-## Immediate resume checklist
-
-1. Add 'mod format;' to src/storage/mod.rs (Lead-owned, ask first).
-2. cargo test to confirm format.rs tests pass.
-3. Implement src/storage/disk.rs exactly as described above.
-4. cargo test (all crate tests, including the 200k-row test).
-5. Report WAL layout, durability window and env tunables to the Lead.

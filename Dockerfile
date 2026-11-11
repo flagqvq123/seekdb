@@ -6,6 +6,7 @@
 # the binary with no arguments: no shell wrapper, no SQL prompt, no listener.
 
 ARG RUST_IMAGE=rust:1.90-slim-bookworm
+ARG RUNTIME_IMAGE=debian:bookworm-slim
 FROM ${RUST_IMAGE} AS builder
 
 ENV CARGO_INCREMENTAL=0 \
@@ -28,7 +29,6 @@ RUN cargo build --release --locked --bin minivectordb
 # /data, which is what lets the unprivileged uid below write there.
 RUN install -d -o 10001 -g 10001 /build/data
 
-ARG RUNTIME_IMAGE=debian:bookworm-slim
 FROM ${RUNTIME_IMAGE} AS runtime
 
 # Dedicated unprivileged account. The judge always provides /data (named

@@ -40,6 +40,7 @@ pub const CONTAINER_HEADER_LEN: usize = 24;
 pub const MAX_CATALOG_BODY: u64 = 64 * 1024 * 1024;
 
 /// Bytes stored per row in the on-disk/in-memory checkpoint index.
+#[allow(dead_code)]
 pub const SLOT_LEN: usize = 20;
 
 // Value tags used by the row encoding.
@@ -221,6 +222,7 @@ pub fn parse_frame_header(bytes: &[u8; HEADER_LEN]) -> Option<FrameHeader> {
     Some(FrameHeader { kind, len })
 }
 
+#[allow(dead_code)]
 pub fn encode_frame(kind: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(frame_total_len(payload.len() as u64) as usize);
     let mut crc = Crc32::new();
@@ -371,6 +373,7 @@ pub fn encode_row_into(out: &mut Vec<u8>, row: &Row) {
     }
 }
 
+#[allow(dead_code)]
 pub fn encode_row(row: &Row) -> Vec<u8> {
     let mut out = Vec::with_capacity(encoded_row_len(row));
     encode_row_into(&mut out, row);

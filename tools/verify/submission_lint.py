@@ -206,6 +206,18 @@ def check_conversation(checks):
         add(checks, "conversation", "FAIL", "top-level JSON value is not an object")
         return None
     add(checks, "conversation", "PASS", "%d bytes, valid JSON object" % size)
+    markers = [name for name in ("TODO", "FIXME", "PLACEHOLDER", "XXX")
+               if name in text]
+    evidence_keys = [key for key in ("user_prompts", "conversations", "experiments",
+                                     "retrospective")
+                     if key in value]
+    if markers or not evidence_keys:
+        add(checks, "conversation_filled", "WARN",
+            "skeleton not ready for scoring: markers=%s evidence_keys=%s; fill with real "
+            "student evidence before the scored submission"
+            % (markers or "none", evidence_keys or "none"))
+    else:
+        add(checks, "conversation_filled", "PASS", "contains evidence sections")
     legacy = ROOT / "conversation.json"
     if legacy.is_file():
         add(checks, "conversation_legacy", "WARN",
@@ -304,9 +316,16 @@ def check_smoke(checks, tag):
                 "--memory=2g", "--memory-swap=2g", "--pids-limit=128",
                 "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
                 "--mount", "type=bind,src=%s,dst=/data" % data_dir, tag]
-        done = run(argv, timeout=180)
-        if done is None or isinstance(done, Exception):
-            add(checks, "image_smoke", "FAIL", "docker run failed: %s" % done)
+        payload = '{"id":1,"op":"shutdown"}\n'
+        try:
+            done = subprocess.run(argv, input=payload, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=180, text=True,
+                                  check=False)
+        except subprocess.TimeoutExpired:
+            add(checks, "image_smoke", "FAIL", "container smoke test timed out")
+            return
+        except OSError as exc:
+            add(checks, "image_smoke", "FAIL", "docker run failed: %s" % exc)
             return
         lines = [line for line in done.stdout.splitlines() if line.strip()]
         if done.returncode != 0:
@@ -335,7 +354,69 @@ def check_smoke(checks, tag):
             pass
 
 
+CHECKLIST_GROUPS = [
+    ("Git / submission", ["branch", "commit_sha", "git_clean", "head_files"]),
+    ("Docker image", ["dockerfile", "dockerignore", "docker_build", "image_entry",
+                      "image_smoke"]),
+    ("Agent material", ["conversation", "conversation_filled"]),
+    ("Functional gate", ["public_cases"]),
+]
+
+
+def check_public_cases(checks, tag, report_dir):
+    """Run the 20 public cases against the lint-built image as a hard gate."""
+    out_dir = report_dir / "gate-public"
+    argv = [sys.executable, str(ROOT / "tools" / "verify" / "run_public.py"),
+            "--image", tag, "--output", str(out_dir)]
+    done = run(argv, cwd=str(ROOT), timeout=3600)
+    summary_path = out_dir / "summary.json"
+    if done is None or isinstance(done, Exception):
+        add(checks, "public_cases", "FAIL", "could not run run_public.py: %s" % done)
+        return
+    if not summary_path.is_file():
+        output = (done.stdout or "") + (done.stderr or "")
+        add(checks, "public_cases", "FAIL",
+            "run_public.py produced no summary.json (exit %s): %s"
+            % (done.returncode, " ".join(output.strip().splitlines()[-3:])[:600]))
+        return
+    summary = strict_json(summary_path.read_text(encoding="utf-8"))
+    totals = summary.get("totals", {})
+    failing = [case["id"] for case in summary.get("cases", [])
+               if case.get("status") != "PASS"]
+    if summary.get("passed") and totals.get("total") == 20 and totals.get("PASS") == 20:
+        add(checks, "public_cases", "PASS", "20/20 public cases passed")
+        return
+    add(checks, "public_cases", "FAIL",
+        "%d/%d passed (%d failed); failing: %s%s"
+        % (totals.get("PASS", 0), totals.get("total", 0), len(failing),
+           ", ".join(failing[:8]), " ..." if len(failing) > 8 else ""))
+
+
+def build_checklist(checks):
+    by_name = {row["name"]: row for row in checks}
+    checklist = []
+    for group, names in CHECKLIST_GROUPS:
+        items = []
+        for name in names:
+            row = by_name.get(name)
+            if row is None:
+                continue
+            items.append({"item": row["name"], "status": row["status"],
+                          "detail": row["detail"]})
+        checklist.append({"group": group, "items": items})
+    return checklist
+
+
 def print_report(checks, sha, extra):
+    print("")
+    print("SUBMISSION CHECKLIST")
+    for group in (extra.get("checklist") if isinstance(extra, dict) else None) or []:
+        print("  [%s]" % group["group"])
+        for item in group["items"]:
+            detail = " ".join(str(item["detail"]).split())
+            if len(detail) > 100:
+                detail = detail[:97] + "..."
+            print("    %-5s %-16s %s" % (item["status"], item["item"], detail))
     print("")
     print("%-18s  %-5s  %s" % ("CHECK", "STATE", "DETAIL"))
     print("-" * 78)
@@ -351,6 +432,7 @@ def print_report(checks, sha, extra):
         print("COMMIT_SHA=%s" % sha)
     print("RESULT: %s  (%d checks, %d fail, %d warn)"
           % ("FAIL" if failed else "PASS", len(checks), len(failed), len(warned)))
+    print("SUBMISSION_READY=%s" % ("NO" if failed else "YES"))
     if failed:
         print("Fix the FAIL rows above before the formal submission "
               "(each failed submission costs an attempt).")
@@ -364,6 +446,8 @@ def main(argv=None):
     parser.add_argument("--use-cache", action="store_true", help="allow docker build cache")
     parser.add_argument("--skip-status", action="store_true", help="skip git status check")
     parser.add_argument("--skip-smoke", action="store_true", help="skip container smoke test")
+    parser.add_argument("--skip-public-cases", action="store_true",
+                        help="skip the 20/20 public-case gate (run_public.py --image)")
     parser.add_argument("--image-tag", help="image tag used by the lint build")
     parser.add_argument("--output", type=Path, help="JSON report path")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
@@ -374,6 +458,11 @@ def main(argv=None):
     if git("rev-parse", "--show-toplevel") is None:
         print("error: git is required", file=sys.stderr)
         return 2
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_path = args.output or (RESULTS_ROOT / ("lint-" + stamp + ".json"))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    report_dir = out_path.parent
 
     checks = []
     check_branch(checks, args.branch)
@@ -397,10 +486,14 @@ def main(argv=None):
                 add(checks, "image_smoke", "SKIP", "--skip-smoke")
             else:
                 check_smoke(checks, tag)
+            if args.skip_public_cases:
+                add(checks, "public_cases", "SKIP", "--skip-public-cases")
+            else:
+                check_public_cases(checks, tag, report_dir)
+        else:
+            add(checks, "public_cases", "SKIP", "image build failed")
 
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_path = args.output or (RESULTS_ROOT / ("lint-" + stamp + ".json"))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    checklist = build_checklist(checks)
     failed = [row for row in checks if row["status"] == "FAIL"]
     report = {
         "generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -411,6 +504,8 @@ def main(argv=None):
         "image": None if args.skip_build else tag,
         "conversation_bytes": conversation_bytes,
         "passed": not failed,
+        "submission_ready": not failed,
+        "checklist": checklist,
         "checks": checks,
     }
     out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",

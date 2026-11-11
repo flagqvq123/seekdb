@@ -378,6 +378,8 @@ impl Engine {
     }
 
     /// Exact TopK over the flat cache (optionally restricted to candidate rows).
+    /// Delegates to the tuned flat scanner in fastscan.rs; ordering is
+    /// (distance ascending, pk ascending) and distances keep f64 semantics.
     fn cache_topk(
         cache: &VectorCache,
         query: &[f32],
@@ -387,39 +389,24 @@ impl Engine {
         if k == 0 || cache.ids.is_empty() {
             return Vec::new();
         }
-        let dim = cache.dim;
-        let n = cache.ids.len();
-        let mut scored: Vec<(f64, i64)> = Vec::with_capacity(match candidates {
-            Some(c) => c.len(),
-            None => n,
-        });
-        let mut compute = |idx: usize| {
-            let row = &cache.flat[idx * dim..(idx + 1) * dim];
-            scored.push((crate::vector::l2_distance(row, query), cache.ids[idx]));
-        };
         match candidates {
-            Some(cands) => {
-                for &idx in cands {
-                    let idx = idx as usize;
-                    if idx < n {
-                        compute(idx);
-                    }
-                }
-            }
-            None => {
-                for idx in 0..n {
-                    compute(idx);
-                }
-            }
+            Some(cands) => crate::fastscan::scan_topk_indices_f64(
+                &cache.flat,
+                &cache.ids,
+                cache.dim,
+                query,
+                k,
+                cands,
+            ),
+            None => crate::fastscan::scan_topk_f64(
+                &cache.flat,
+                &cache.ids,
+                cache.ids.len(),
+                cache.dim,
+                query,
+                k,
+            ),
         }
-        let k = k.min(scored.len());
-        scored.sort_unstable_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        scored.truncate(k);
-        scored.into_iter().map(|(d, id)| (id, d)).collect()
     }
 
     /// Detect and execute the hot pattern:
