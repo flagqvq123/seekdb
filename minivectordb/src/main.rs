@@ -1,7 +1,9 @@
 //! MiniVectorDB: single-process embedded SQL + vector engine speaking the
 //! competition JSON Lines protocol over stdin/stdout.
 
+mod ann;
 mod engine;
+mod fastscan;
 mod exec;
 mod json;
 mod sql;

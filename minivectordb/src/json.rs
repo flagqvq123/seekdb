@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn escapes_and_unicode() {
-        let v = Json::parse(r#""a\"b\\c\u4e2d\\u6587""#).unwrap();
+        let v = Json::parse(r#""a\"b\\c\u4e2d\u6587""#).unwrap();
         assert_eq!(v.as_str().unwrap(), "a\"b\\c中文");
     }
 

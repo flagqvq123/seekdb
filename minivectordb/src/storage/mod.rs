@@ -42,12 +42,14 @@ struct Txn {
     new_indexes: Vec<(u32, usize)>,
     table_mark: usize,
     index_mark: usize,
+    undo_mark: usize,
 }
 
 impl Txn {
     fn mark(&mut self) {
         self.table_mark = self.new_tables.len();
         self.index_mark = self.new_indexes.len();
+        self.undo_mark = self.undo.len();
     }
 }
 
@@ -198,7 +200,7 @@ impl Storage for MemStorage {
 
     fn rollback_statement(&mut self) -> DbResult<()> {
         let Some(txn) = &mut self.txn else { return Ok(()) };
-        while !txn.undo.is_empty() {
+        while txn.undo.len() > txn.undo_mark {
             let (tid, pk, prev) = txn.undo.pop().unwrap();
             match prev {
                 None => {

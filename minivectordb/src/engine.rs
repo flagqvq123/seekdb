@@ -1,6 +1,6 @@
 //! Query engine: statement dispatch, DDL, DML, transaction control and SELECT.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::exec;
@@ -8,20 +8,33 @@ use crate::sql::ast::{ColumnSpec, Expr, SelectItem, Stmt};
 use crate::storage::{DiskStorage, MemStorage, Storage};
 use crate::types::*;
 
+/// Maximum number of bytes of vector payload kept in the in-memory hot cache.
+const VECTOR_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Flat row-major cache of one vector column, used by the fast exact TopK path.
+struct VectorCache {
+    dim: usize,
+    ids: Vec<i64>,
+    flat: Vec<f32>,
+    pk_to_idx: HashMap<i64, u32>,
+}
+
 pub struct Engine {
     storage: Box<dyn Storage>,
-    /// Tables whose vector indexes need rebuilding after a commit.
+    /// Tables whose vector caches are stale after writes.
     dirty_tables: HashSet<u32>,
+    /// Hot vector column cache keyed by (table id, column index).
+    vec_cache: HashMap<(u32, usize), VectorCache>,
 }
 
 impl Engine {
     pub fn open(dir: &Path) -> DbResult<Engine> {
         let storage = DiskStorage::open(dir)?;
-        Ok(Engine { storage: Box::new(storage), dirty_tables: HashSet::new() })
+        Ok(Engine { storage: Box::new(storage), dirty_tables: HashSet::new(), vec_cache: HashMap::new() })
     }
 
     pub fn open_memory() -> Engine {
-        Engine { storage: Box::new(MemStorage::new()), dirty_tables: HashSet::new() }
+        Engine { storage: Box::new(MemStorage::new()), dirty_tables: HashSet::new(), vec_cache: HashMap::new() }
     }
 
     pub fn shutdown(&mut self) -> DbResult<()> {
@@ -317,6 +330,238 @@ impl Engine {
         Ok(ExecResult::Affected(count))
     }
 
+
+    /// Build (or refresh) the flat vector cache for one column.
+    /// Returns false when the column does not fit the memory budget.
+    fn ensure_vector_cache(&mut self, table: &TableDef, col: usize) -> DbResult<bool> {
+        let key = (table.id, col);
+        let dirty = self.dirty_tables.contains(&table.id);
+        let needs_build = dirty || !self.vec_cache.contains_key(&key);
+        if !needs_build {
+            return Ok(true);
+        }
+        let dim = match table.columns[col].ty.vector_dim() {
+            Some(d) => d,
+            None => return Ok(false),
+        };
+        let mut ids: Vec<i64> = Vec::new();
+        let mut flat: Vec<f32> = Vec::new();
+        let mut overflow = false;
+        {
+            let budget = VECTOR_CACHE_BUDGET_BYTES;
+            self.storage.scan(table.id, &mut |pk, row| {
+                if let Some(Value::Vec(v)) = row.get(col) {
+                    if (flat.len() + v.len()) * 4 > budget {
+                        overflow = true;
+                        return false;
+                    }
+                    ids.push(pk);
+                    flat.extend_from_slice(v);
+                }
+                true
+            })?;
+        }
+        if overflow {
+            self.vec_cache.remove(&key);
+            return Ok(false);
+        }
+        let mut pk_to_idx = HashMap::with_capacity(ids.len());
+        for (i, pk) in ids.iter().enumerate() {
+            pk_to_idx.insert(*pk, i as u32);
+        }
+        self.vec_cache.insert(key, VectorCache { dim, ids, flat, pk_to_idx });
+        Ok(true)
+    }
+
+    fn cache_key(table_id: u32, col: usize) -> (u32, usize) {
+        (table_id, col)
+    }
+
+    /// Exact TopK over the flat cache (optionally restricted to candidate rows).
+    fn cache_topk(
+        cache: &VectorCache,
+        query: &[f32],
+        k: usize,
+        candidates: Option<&[u32]>,
+    ) -> Vec<(i64, f64)> {
+        if k == 0 || cache.ids.is_empty() {
+            return Vec::new();
+        }
+        let dim = cache.dim;
+        let n = cache.ids.len();
+        let mut scored: Vec<(f64, i64)> = Vec::with_capacity(match candidates {
+            Some(c) => c.len(),
+            None => n,
+        });
+        let mut compute = |idx: usize| {
+            let row = &cache.flat[idx * dim..(idx + 1) * dim];
+            scored.push((crate::vector::l2_distance(row, query), cache.ids[idx]));
+        };
+        match candidates {
+            Some(cands) => {
+                for &idx in cands {
+                    let idx = idx as usize;
+                    if idx < n {
+                        compute(idx);
+                    }
+                }
+            }
+            None => {
+                for idx in 0..n {
+                    compute(idx);
+                }
+            }
+        }
+        let k = k.min(scored.len());
+        scored.sort_unstable_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        scored.truncate(k);
+        scored.into_iter().map(|(d, id)| (id, d)).collect()
+    }
+
+    /// Detect and execute the hot pattern:
+    /// SELECT ... L2_DISTANCE(col, q) ... [WHERE cond] ORDER BY distance LIMIT k
+    fn try_vector_fast_path(
+        &mut self,
+        items: &[SelectItem],
+        table: &TableDef,
+        filter: Option<&Expr>,
+        order_by: &[crate::sql::ast::OrderKey],
+        limit: Option<usize>,
+    ) -> DbResult<Option<ExecResult>> {
+        let limit = match limit {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        if order_by.len() != 1 || order_by[0].desc {
+            return Ok(None);
+        }
+        if self.storage.in_txn() {
+            return Ok(None);
+        }
+        // Resolve the ordered distance expression and its vector column.
+        let distance_expr: Expr = match &order_by[0].expr {
+            Expr::L2Distance { .. } => order_by[0].expr.clone(),
+            Expr::Column(alias) => {
+                let mut found: Option<Expr> = None;
+                for item in items {
+                    if let SelectItem::Expr { expr, alias: item_alias } = item {
+                        if item_alias.eq_ignore_ascii_case(alias) {
+                            found = Some(expr.clone());
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(expr) => match expr {
+                        Expr::L2Distance { .. } => expr,
+                        _ => return Ok(None),
+                    },
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        let (column_name, query_expr) = match &distance_expr {
+            Expr::L2Distance { column, query } => (column.clone(), query.clone()),
+            _ => return Ok(None),
+        };
+        let col = match table.column_index(&column_name) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let dim = match table.columns[col].ty.vector_dim() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        // Only plain literal queries are hot-path eligible.
+        let query_value = exec::eval(&query_expr, table, None)?;
+        let query: Vec<f32> = match query_value {
+            Value::Str(s) => match crate::vector::parse_vector(&s) {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            },
+            Value::Vec(v) => v,
+            _ => return Ok(None),
+        };
+        crate::vector::validate_dim(&query, dim)?;
+        if !self.ensure_vector_cache(table, col)? {
+            return Ok(None);
+        }
+        let key = Self::cache_key(table.id, col);
+        let candidates: Option<Vec<u32>> = match filter {
+            None => None,
+            Some(cond) => {
+                let cache = match self.vec_cache.get(&key) {
+                    Some(c) => c,
+                    None => return Ok(None),
+                };
+                let mut cands: Vec<u32> = Vec::new();
+                let mut error: Option<DbError> = None;
+                {
+                    let pk_to_idx = &cache.pk_to_idx;
+                    let stop_limit = usize::MAX;
+                    self.storage.scan(table.id, &mut |pk, row| {
+                        match exec::eval(cond, table, Some(row)) {
+                            Ok(v) => {
+                                if exec::truthy(&v) {
+                                    if let Some(idx) = pk_to_idx.get(&pk) {
+                                        cands.push(*idx);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error = Some(e);
+                                return false;
+                            }
+                        }
+                        cands.len() < stop_limit
+                    })?;
+                }
+                if let Some(e) = error {
+                    return Err(e);
+                }
+                Some(cands)
+            }
+        };
+        let scored = {
+            let cache = match self.vec_cache.get(&key) {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+            Self::cache_topk(cache, &query, limit, candidates.as_deref())
+        };
+        let mut columns = Vec::with_capacity(items.len());
+        for item in items {
+            columns.push(exec::projection_name(item, table)?);
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(scored.len());
+        for (pk, _dist) in &scored {
+            let row = match self.storage.get(table.id, *pk)? {
+                Some(r) => r,
+                None => continue,
+            };
+            let mut projected = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    SelectItem::Star => {}
+                    SelectItem::Column { name } => {
+                        let idx = exec::resolve_column(table, name)?;
+                        projected.push(row[idx].clone());
+                    }
+                    SelectItem::Expr { expr, .. } => {
+                        projected.push(exec::eval(expr, table, Some(&row))?);
+                    }
+                }
+            }
+            rows.push(projected);
+        }
+        Ok(Some(ExecResult::Query { columns, rows }))
+    }
+
     fn select(
         &mut self,
         items: &[SelectItem],
@@ -330,6 +575,10 @@ impl Engine {
         let mut columns = Vec::with_capacity(items.len());
         for item in &items {
             columns.push(exec::projection_name(item, &table)?);
+        }
+
+        if let Some(result) = self.try_vector_fast_path(&items, &table, filter, order_by, limit)? {
+            return Ok(result);
         }
 
         struct OutRow {

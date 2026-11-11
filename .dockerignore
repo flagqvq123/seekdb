@@ -1,0 +1,10 @@
+# The repository root holds a complete seekdb source tree (tens of thousands
+# of files); only the competition crate belongs in the Docker build context.
+# Keep this list in sync with the COPY steps in the Dockerfile.
+**
+!minivectordb/
+minivectordb/**
+!minivectordb/Cargo.toml
+!minivectordb/Cargo.lock
+!minivectordb/src/
+!minivectordb/src/**
