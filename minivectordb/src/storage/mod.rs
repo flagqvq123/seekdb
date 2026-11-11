@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::types::{ColumnDef, DbError, DbResult, Row, TableDef};
 
 pub mod disk;
+pub mod format;
 pub use disk::DiskStorage;
 
 pub trait Storage: Send {

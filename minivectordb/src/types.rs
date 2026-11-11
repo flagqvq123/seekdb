@@ -121,14 +121,14 @@ impl Value {
 
 pub type Row = Vec<Value>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ColumnDef {
     pub name: String,
     pub ty: ColType,
     pub is_pk: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TableDef {
     pub id: u32,
     pub name: String,
