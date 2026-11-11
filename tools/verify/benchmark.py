@@ -48,7 +48,7 @@ HERE = Path(__file__).resolve()
 ROOT = HERE.parents[2]
 RESULTS_ROOT = ROOT / "protocol-results"
 sys.path.insert(0, str(HERE.parent))
-from run_public import Session, strict_json  # noqa: E402  (same directory module)
+from run_public import Session, scratch_dir, strict_json  # noqa: E402
 
 DEFAULT_CONFIG = ROOT / "protocol_check" / "config.json"
 
@@ -219,7 +219,7 @@ def main(argv=None):
     data_dir = None
     bind_dir = None
     if args.image:
-        data_dir = tempfile.mkdtemp(prefix="mvdb-bench-data-")
+        data_dir = tempfile.mkdtemp(prefix="mvdb-bench-data-", dir=scratch_dir())
         if os.name != "nt":
             os.chmod(data_dir, 0o777)
         bind_dir = data_dir

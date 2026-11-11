@@ -13,8 +13,11 @@ benchmark 的单一入口说明。协议权威定义见 `STDIO_PROTOCOL.md`，�
 | `.dockerignore` | 把构建上下文限制在 minivectordb crate | harness |
 | `tools/verify/run_public.py` | 跨平台公开用例 runner（binary / image） | harness |
 | `tools/verify/wsl_run.sh` | WSL 内构建 Linux release 并跑公开用例 | harness |
-| `tools/verify/submission_lint.py` | 提交前检查（分支/SHA/Dockerfile/conversation.json） | harness |
+| `tools/verify/submission_lint.py` | 提交前检查（分支/SHA/Dockerfile/conversation.json/20-20 公开用例门槛） | harness |
+| `tools/verify/clean_clone_check.py` | 干净导出 commit -> docker build -> 判题参数跑协议样例 | harness |
 | `tools/verify/benchmark.py` | 3.3 节形状的性能 benchmark | harness |
+| `docs/SUBMISSION_CHECKLIST.md` | 从合并分支到记录 40 位 SHA 的提测步骤 | harness |
+| `agent/conversation.json` | Agent prompt 材料（结构骨架，学生填真实证据） | 用户/Lead |
 | `protocol-results/` | 所有测试产物（已被 .gitignore 忽略） | - |
 
 正式提交要求：`2026-competition-round2` 分支上的同一次 commit 必须同时包含源码、
@@ -89,6 +92,8 @@ docker build -t minivectordb:round2 .
 镜像结构：`rust:1.90-slim-bookworm` 多阶段编译（`--locked`）-> `debian:bookworm-slim`
 运行阶段只含二进制；非 root uid 10001；`/data` 在镜像内已 chown，命名 volume 首次挂载会继承属主；
 `ENTRYPOINT` 直接运行二进制（无 shell 包装、无 SQL 提示符、无网络监听），默认数据目录 `/data`。
+基础镜像按 tag 锁定（2026-11-11 实测 digest：rust `sha256:64232e65...`、debian
+`sha256:734a72b3...`）；构建阶段不装任何依赖、不联网，`Cargo.lock` + `--locked` 锁定 crate 依赖。
 
 判题器同款运行方式（等价于 STDIO_PROTOCOL.md 第 7 节；Windows 可用 WSL/Git Bash 或直接
 `python tools/verify/run_public.py --image`）：
@@ -113,6 +118,21 @@ columns=[id, content]、rows=[[1, "你好"]]）、`{"id":4,"ok":true}`，退出�
 
 只测镜像握手：`python tools/verify/run_public.py --image minivectordb:round2 --handshake-only`。
 
+### 6.1 干净 commit 复核（模拟平台构建）
+
+```bash
+python tools/verify/clean_clone_check.py                 # 导出 HEAD 已提交文件 -> build -> 跑 §7 样例
+python tools/verify/clean_clone_check.py --archive-full  # 导出整棵树（更慢、更严格）
+python tools/verify/clean_clone_check.py --from-worktree  # 仅调试：用当前工作区，不证明可提交性
+```
+
+该脚本用 `git archive` 只导出该 ref 的已提交内容（不含本地 `target/`、二进制和未提交修改），
+因此能发现"Dockerfile/源码没进 commit""依赖本地预编译产物""构建上下文过大"等问题。
+预期输出 `RESULT: PASS` 和 `COMMIT_SHA=...`。首次构建需基础镜像缓存在本机（或可联网）。
+
+注意：`submission_lint.py` 的 docker build 使用当前工作区，因此队友还有未提交改动时可能因瞬时
+编译错误失败；正式提测前应在干净、可编译的工作区（或已提交的最终 commit）上跑。
+
 ## 7. 提交前检查（submission lint）
 
 ```bash
@@ -127,8 +147,13 @@ python tools/verify/submission_lint.py --use-cache      # 允许构建缓存
 `agent/conversation.json` 存在、<=128 KiB、UTF-8、合法 JSON 对象；git 工作区干净；
 HEAD 同时包含 Dockerfile、crate 源码和 conversation.json；最后打印 40 位 `COMMIT_SHA=...`。
 
-当前仓库提醒：工作区在 `round2-impl` 分支且存在未提交文件，lint 会失败——正式提交前
-Lead 需切到 `2026-competition-round2` 并创建包含全部产物的单个 commit。
+lint 还会用刚构建的镜像跑完整 20 个公开用例作为功能门槛（`--skip-public-cases` 仅用于
+本地临时跳过），并输出分组 checklist 与 `SUBMISSION_READY=YES/NO`。
+
+当前仓库提醒：工作区在 `round2-impl` 分支且存在未提交文件，lint 会因
+`branch`/`git_clean`/`head_files` 失败——正式提交前 Lead 需切到
+`2026-competition-round2` 并创建包含全部产物的单个 commit。详见
+`docs/SUBMISSION_CHECKLIST.md`。
 
 ## 8. 性能 benchmark（3.3 节形状）
 
@@ -159,31 +184,40 @@ python tools/verify/benchmark.py --image minivectordb:round2 \
 | `database exited before response` | 容器入口/依赖/权限问题，看 `<case>.stderr.log` |
 | `response id differs` / `missing boolean ok` | id 类型被改（1 vs "1"）、ok 不是布尔 |
 | `extra stdout or nonzero exit after shutdown` | shutdown 响应后继续输出或非 0 退出 |
-| `table_not_found` after `--restart` | 持久化未实现（当前 DiskStorage 为 stub，见第 10 节） |
+| `table_not_found` after `--restart` | 持久化/恢复失败；看 `--restart` 用例的 stderr 与 `/data` 内 CURRENT/ckpt/wal 文件 |
+| Windows 原生启动报 `os error 5` 打不开数据目录 | 某些主机的 `%TEMP%` 不允许新 WAL 建文件；runner 已改用仓库内 `protocol-results/tmp`，或改用 WSL/Docker |
 | `docker build` 拉取失败 | Docker Hub 连接被重置时重试；镜像已缓存后无需网络 |
 | 只读根文件系统下崩溃 | 程序只能写 /data；临时文件不要写 /tmp 之外的根目录 |
 | /data 权限拒绝 | 命名 volume 会继承镜像 /data 属主；bind mount 需 777（判题器示例亦如此） |
 
-## 10. 当前状态与已知限制（2026-11-11 基线）
+## 10. 当前状态与已知限制（2026-11-11 21:20 更新）
 
-- Rust crate 可编译；`cargo build --release` 通过（有 dead_code 警告）。
-- 20 个公开用例：13 PASS / 7 FAIL / 0 timeout，耗时约 0.3s（原生）/ 14s（镜像容器启动开销）。
-- 7 个失败全部是带 `--restart` 的持久化用例：storage_restart、storage_mutations、
-  storage_multiple_tables、vector_index_maintenance、transaction_failed_insert、
-  transaction_autocommit_atomic、transaction_shutdown_rollback。根因是
-  `src/storage/disk.rs` 目前 delegate 到内存实现（stub），重启后表丢失，属已知待修复项。
-- Docker 镜像已按判题器参数验证：握手 + 3 条 SQL + shutdown 通过，只读根文件系统、命名
-  volume 与 777 bind mount 下非 root 均可写 /data。
+- Rust crate 可编译；`cargo build --release --locked` 通过，`cargo test` 32 passed / 0 failed。
+- 20 个公开用例：**20/20 PASS**（Windows 原生约 1.1s；Docker 镜像带容器启动开销约 20s）。
+  WAL 持久化落地后，此前 7 个 `--restart` 失败用例（storage_restart 等）已全部通过。
+- 已用 `clean_clone_check.py --ref HEAD` 对 commit `b0c0f78` 完成干净复核：`git archive`
+  只导出已提交内容 -> docker build PASS（上下文 394 B）-> 判题参数跑 §7 样例 PASS；
+  再用该镜像跑公开用例 **20/20 PASS**（18.2 s）。
+- Dockerfile 在本轮复核中发现并修复一处真实缺陷：`ARG RUNTIME_IMAGE` 原本写在第一个
+  `FROM` 之后，导致第二个 `FROM` 的镜像名为空、构建失败。现在两个全局 ARG 都在第一个
+  `FROM` 之前；`clean_clone_check.py` 从已提交树重建镜像并通过 §7 协议样例。
+- 构建上下文 384 B（仅 minivectordb 的 Cargo.toml/Cargo.lock/src 共 15 个文件）；镜像约 115 MiB；
+  非 root uid 10001；只读根文件系统 + 命名 volume / 777 bind mount 下均可写 /data。
 - Windows 便携 transport 与官方 selectors transport 的唯一已知差异：请求发送瞬间未读取的
   "多余 stdout" 可能延迟到 shutdown 才被判定（官方实现会在每次发送前 poll）；对正常实现无影响。
+- 本机部分 Windows 主机的 `%TEMP%` 不允许新 WAL 建文件（os error 5）；runner 已默认改用
+  仓库内 `protocol-results/tmp`，因此原生验证不受影响。
 - 协议仍以题包 JSONL 为准。赛题文档有一句暗示后续协议可能调整，若上游更换驱动需重跑
   `run_public.py --runner portable` 适配。
-- 提交分支尚未切到 `2026-competition-round2`，`agent/conversation.json` 尚未创建，lint 会失败。
+- 提交分支尚未切到 `2026-competition-round2`；`agent/conversation.json` 已创建结构骨架
+  （TODO 占位，待学生填真实证据）。lint 当前仅剩 `branch`/`git_clean`/`head_files`
+  失败，属提交动作本身，见 `docs/SUBMISSION_CHECKLIST.md`。
 
 ## 11. 下次恢复从哪继续
 
-1. `git switch 2026-competition-round2`（或从该分支新建工作分支并在提交时合并）。
-2. 修完 disk 持久化后重跑：`python tools/verify/run_public.py --binary ...` 直到 20/20 PASS。
-3. `python tools/verify/run_public.py --image minivectordb:round2` 复核镜像。
-4. 创建 `agent/conversation.json`（<=128 KiB 合法 JSON）后跑
-   `python tools/verify/submission_lint.py`，把 `COMMIT_SHA` 和分支名提交到平台。
+1. 把当前工作区（含本轮 Dockerfile 修复与验证脚本）提交到 `round2-impl`，再合并/切到
+   `2026-competition-round2`（见 `docs/SUBMISSION_CHECKLIST.md` 第 1-2 步）。
+2. `python tools/verify/run_public.py --binary ...` 与 `--image ...` 复核 20/20。
+3. `python tools/verify/clean_clone_check.py --ref HEAD`（提交后跑）确认干净树可构建。
+4. 由学生填写 `agent/conversation.json` 真实证据后跑完整 `python tools/verify/submission_lint.py`，
+   取得 `SUBMISSION_READY=YES`、`COMMIT_SHA=...` 后按检查清单提测。

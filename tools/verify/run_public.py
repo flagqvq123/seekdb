@@ -46,6 +46,7 @@ PROTOCOL_CHECK = ROOT / "protocol_check"
 PACKAGE = ROOT / "mysqltest"
 CONFIG_PATH = PROTOCOL_CHECK / "config.json"
 RESULTS_ROOT = ROOT / "protocol-results"
+SCRATCH_ROOT = RESULTS_ROOT / "tmp"
 STATUS_ORDER = ("PASS", "FAIL", "TIMEOUT", "ERROR", "SKIPPED")
 FENCE = "```"
 
@@ -91,6 +92,23 @@ def within(root, relative):
     return path
 
 
+def scratch_dir():
+    """Preferred data-directory root for spawned processes.
+
+    A repo-local scratch root is used so verification does not depend on the
+    system temp directory: on some Windows hosts the WAL storage gets
+    access-denied when creating files under the user %TEMP% directory.
+    """
+    try:
+        SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+        probe = SCRATCH_ROOT / ".write-probe"
+        probe.write_bytes(b"")
+        probe.unlink()
+        return str(SCRATCH_ROOT)
+    except OSError:
+        return None
+
+
 def timestamp():
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -129,7 +147,8 @@ class Session:
         self.name = "mvdb-verify-" + uuid.uuid4().hex[:12]
         self.volume = self.name + "-data"
         self.volume_created = False
-        self.temp = tempfile.TemporaryDirectory(prefix="mvdb-verify-") if command else None
+        self.temp = (tempfile.TemporaryDirectory(prefix="mvdb-verify-", dir=scratch_dir())
+                     if command else None)
         self.data_dir = self.temp.name if self.temp is not None else None
         self.proc = None
         self.log = None
