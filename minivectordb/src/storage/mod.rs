@@ -30,6 +30,12 @@ pub trait Storage: Send {
     fn delete(&mut self, table_id: u32, pk: i64) -> DbResult<bool>;
     fn scan(&self, table_id: u32, f: &mut dyn FnMut(i64, &Row) -> bool) -> DbResult<()>;
 
+    /// Cheap upper-bound hint of the visible row count, used to decide whether a
+    /// table could ever fit an in-memory query cache. None means "unknown".
+    fn row_count_hint(&self, _table_id: u32) -> Option<usize> {
+        None
+    }
+
     fn flush(&mut self) -> DbResult<()>;
 }
 
@@ -317,6 +323,10 @@ impl Storage for MemStorage {
             }
         }
         Ok(())
+    }
+
+    fn row_count_hint(&self, table_id: u32) -> Option<usize> {
+        Some(self.rows.get(&table_id).map(|m| m.len()).unwrap_or(0))
     }
 
     fn flush(&mut self) -> DbResult<()> {

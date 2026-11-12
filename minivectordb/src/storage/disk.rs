@@ -1160,6 +1160,12 @@ impl Storage for DiskStorage {
         Ok(())
     }
 
+    fn row_count_hint(&self, table_id: u32) -> Option<usize> {
+        let base = self.base.get(&table_id).map(|slots| slots.len()).unwrap_or(0);
+        let overlay = self.committed.get(&table_id).map(|rows| rows.len()).unwrap_or(0);
+        Some(base + overlay)
+    }
+
     fn flush(&mut self) -> DbResult<()> {
         if self.txn.is_none() {
             self.checkpoint()?;

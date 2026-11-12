@@ -8,7 +8,7 @@ use crate::sql::ast::{ColumnSpec, Expr, SelectItem, Stmt};
 use crate::storage::{DiskStorage, MemStorage, Storage};
 use crate::types::*;
 
-use crate::table_cache::{TableCache, DEFAULT_CACHE_BUDGET_BYTES};
+use crate::table_cache::{cache_budget, TableCache};
 
 pub struct Engine {
     storage: Box<dyn Storage>,
@@ -16,16 +16,19 @@ pub struct Engine {
     dirty_tables: HashSet<u32>,
     /// Hot cache of the most recently queried table.
     cache: Option<TableCache>,
+    /// (table id, vector column) already known not to fit the cache budget.
+    /// Avoids rescanning the table on every query (found by the student).
+    cache_too_large: Option<(u32, usize)>,
 }
 
 impl Engine {
     pub fn open(dir: &Path) -> DbResult<Engine> {
         let storage = DiskStorage::open(dir)?;
-        Ok(Engine { storage: Box::new(storage), dirty_tables: HashSet::new(), cache: None })
+        Ok(Engine { storage: Box::new(storage), dirty_tables: HashSet::new(), cache: None, cache_too_large: None })
     }
 
     pub fn open_memory() -> Engine {
-        Engine { storage: Box::new(MemStorage::new()), dirty_tables: HashSet::new(), cache: None }
+        Engine { storage: Box::new(MemStorage::new()), dirty_tables: HashSet::new(), cache: None, cache_too_large: None }
     }
 
     pub fn shutdown(&mut self) -> DbResult<()> {
@@ -53,14 +56,14 @@ impl Engine {
             Stmt::Commit => {
                 if self.storage.in_txn() {
                     self.storage.commit()?;
-                    self.dirty_tables.clear();
+                    self.invalidate_caches();
                 }
                 Ok(ExecResult::Ack)
             }
             Stmt::Rollback => {
                 if self.storage.in_txn() {
                     self.storage.rollback()?;
-                    self.dirty_tables.clear();
+                    self.invalidate_caches();
                 }
                 Ok(ExecResult::Ack)
             }
@@ -95,7 +98,10 @@ impl Engine {
             self.storage.begin()?;
             match f(self) {
                 Ok(v) => match self.storage.commit() {
-                    Ok(()) => Ok(v),
+                    Ok(()) => {
+                        self.invalidate_caches();
+                        Ok(v)
+                    }
                     Err(e) => {
                         self.storage.rollback().ok();
                         Err(e)
@@ -322,6 +328,13 @@ impl Engine {
     }
 
 
+    /// Drop every hot cache; called whenever committed data changes.
+    fn invalidate_caches(&mut self) {
+        self.cache = None;
+        self.cache_too_large = None;
+        self.dirty_tables.clear();
+    }
+
     /// Ensure the hot cache for this table/vector column is fresh.
     fn ensure_cache(&mut self, table: &TableDef, col: usize) -> DbResult<bool> {
         let dirty = self.dirty_tables.contains(&table.id);
@@ -332,13 +345,34 @@ impl Engine {
         if reusable && !dirty {
             return Ok(true);
         }
+        let budget = cache_budget();
+        // Cheap pre-check: never scan a table we already know cannot fit.
+        if !dirty {
+            if let Some((tid, col_idx)) = self.cache_too_large {
+                if tid == table.id && col_idx == col {
+                    return Ok(false);
+                }
+            }
+            let dim = table.columns[col].ty.vector_dim().unwrap_or(0);
+            if let Some(rows) = self.storage.row_count_hint(table.id) {
+                let estimate = rows.saturating_mul(dim * 4 + 64);
+                if estimate > budget {
+                    self.cache_too_large = Some((table.id, col));
+                    return Ok(false);
+                }
+            }
+        }
         self.cache = None;
-        match TableCache::build(&*self.storage, table, col, DEFAULT_CACHE_BUDGET_BYTES)? {
+        match TableCache::build(&*self.storage, table, col, budget)? {
             Some(cache) => {
                 self.cache = Some(cache);
+                self.cache_too_large = None;
                 Ok(true)
             }
-            None => Ok(false),
+            None => {
+                self.cache_too_large = Some((table.id, col));
+                Ok(false)
+            }
         }
     }
 

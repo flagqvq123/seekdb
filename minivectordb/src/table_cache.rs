@@ -11,8 +11,19 @@ use std::collections::HashMap;
 use crate::storage::Storage;
 use crate::types::{DbResult, Row, TableDef, Value};
 
-/// Bytes of vector payload we are willing to keep resident for hot queries.
+/// Bytes we are willing to keep resident for hot queries.
 pub const DEFAULT_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Cache budget, overridable with MINIVECTORDB_CACHE_MIB (useful for tests).
+pub fn cache_budget() -> usize {
+    match std::env::var("MINIVECTORDB_CACHE_MIB") {
+        Ok(text) => match text.trim().parse::<u64>() {
+            Ok(mib) => (mib as usize).saturating_mul(1024 * 1024),
+            Err(_) => DEFAULT_CACHE_BUDGET_BYTES,
+        },
+        Err(_) => DEFAULT_CACHE_BUDGET_BYTES,
+    }
+}
 
 #[derive(PartialEq, Eq, Hash)]
 enum EqKey {
