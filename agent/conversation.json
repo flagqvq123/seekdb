@@ -4,11 +4,14 @@
     "project": "OceanBase/seekdb 2026 数据库大赛 Round2 - MiniVectorDB",
     "branch": "2026-competition-round2",
     "commit_sha": "TODO_FINAL_COMMIT_SHA",
-    "material_status": "DRAFT_WITH_REAL_EVIDENCE_PENDING_RETROSPECTIVE",
+    "material_status": "READY_EXCEPT_FINAL_COMMIT_SHA",
     "synthetic": false,
     "language": "zh-CN",
     "scope": "2026-11-11 至 2026-11-12 的真实人机协作记录：以下 student 发言均为学生原话（逐字），tool 结果为本地真实命令输出（节选），agent 内容仅作上下文，不作为学生学习证据。",
-    "redactions": ["本机绝对路径已省略或简写", "GitHub 账号名保留（公开 fork），未包含任何 token/密钥"],
+    "redactions": [
+      "本机绝对路径已省略或简写",
+      "GitHub 账号名保留（公开 fork），未包含任何 token/密钥"
+    ],
     "notes": [
       "本文件中的 student 条目全部来自真实对话，未改写、未代写。",
       "agent 的规划与解释不计入学生贡献；学生自己的提问、判断、验证设计与结果解释单独标注。",
@@ -216,12 +219,32 @@
     }
   ],
   "retrospective": {
-    "status": "TODO_STUDENT",
-    "notes": [
-      "TODO(student): 用可复现实验代替猜测的价值与局限",
-      "TODO(student): ANN 降级（精确扫描代替索引）的取舍解释",
-      "TODO(student): 这两天如果重来，哪一步会做得不一样"
-    ]
+    "status": "STUDENT_ANSWERS_RECORDED_VERBATIM",
+    "entries": [
+      {
+        "id": "retro-1",
+        "question": "两次提测失败后改用“复现同类缺陷再提交”的做法，价值与局限是什么？",
+        "student_answer": "自建用例的价值在于官方不提供正式用例的情形下通过复现同种类bug以获取更多关于提测的信息，自建各种情形下的用例有助于错误的排查，但是局限正是在于我们和官方用例始终存在差距。",
+        "evidence_dimension": "独立验证与质疑",
+        "student_evidence_pointer": "/retrospective/entries/0/student_answer"
+      },
+      {
+        "id": "retro-2",
+        "question": "为什么接受用精确扫描替代 ANN 索引？",
+        "student_answer": "就是正确率达不到（测试0.865vs要求0.95），且有构建的成本性能。不过面对大数据量时，我们的实现会因为缓存空间不足回退到磁盘扫描，开销会很大。",
+        "evidence_dimension": "取舍与反思",
+        "student_evidence_pointer": "/retrospective/entries/1/student_answer",
+        "follow_up": "学生随即提出改进方向：能否通过索引构建等方式提升磁盘全量扫描速率（见 2026-11-12 晚间讨论）。"
+      },
+      {
+        "id": "retro-3",
+        "question": "这两天如果要重来，哪一步会做得不一样？",
+        "student_answer": "我可能会在第一次提测失败后强制要求你能够复现同种情况的bug后再次提交，并且要求你提供相关的证据辅助我判断。",
+        "evidence_dimension": "取舍与反思",
+        "student_evidence_pointer": "/retrospective/entries/2/student_answer"
+      }
+    ],
+    "process_change": "已固化为 docs/materials/REPRO_MATRIX.md：每次提测前必须给出“旧版本失败 / 新版本通过 / 回归用例已加”的复现证据。"
   },
   "limitations": [
     "ANN 近似索引未实现：ann 模式复用精确扫描（Recall=1.0），满足召回要求但不具备亚线性检索性能。",
