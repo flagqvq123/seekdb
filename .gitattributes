@@ -10,3 +10,7 @@
 *.i filter=codeformat
 *.ic filter=codeformat
 *.js filter=codeformat
+# Round-2 additions: keep Linux-facing scripts LF even when checked out on Windows.
+*.sh text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
