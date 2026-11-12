@@ -1,0 +1,34 @@
+{
+  "generated_at": "2026-11-12T16:07:19+08:00",
+  "scope": "local benchmark approximation of competition section 3.3",
+  "target": {
+    "kind": "binary",
+    "value": "D:\\4dsh\\seekdb-competition\\seekdb\\minivectordb\\target\\release\\minivectordb.exe"
+  },
+  "params": {
+    "records": 10000,
+    "dim": 128,
+    "batch": 100,
+    "queries": 1000,
+    "k": 10,
+    "seed": 20261111,
+    "transactions": true,
+    "vector_index": false
+  },
+  "startup_ms": 80.5,
+  "rows_written": 10000,
+  "T_write_ms": 526.3,
+  "T_query_ms": 398.2,
+  "queries_ok": 1000,
+  "rows_returned": 10000,
+  "unique_ids": true,
+  "peak_mem_mb": 21.5,
+  "peak_mem_source": "windows_peak_working_set",
+  "data_dir_bytes": 5562553,
+  "io_bytes_source": "data_dir_size_lower_bound",
+  "io_bytes_approx": 5562553,
+  "write_rows_per_second": 19000.1,
+  "query_qps": 2511.4,
+  "errors": [],
+  "ok": true
+}

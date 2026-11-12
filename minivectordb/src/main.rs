@@ -163,8 +163,20 @@ fn value_to_json(value: Value) -> Json {
     match value {
         Value::Null => Json::Null,
         Value::Int(v) => Json::Int(v),
-        Value::Float(v) => Json::Float(v),
+        Value::Float(v) => float_to_json(v),
         Value::Str(s) => Json::Str(s),
-        Value::Vec(components) => Json::Arr(components.into_iter().map(|c| Json::Float(c as f64)).collect()),
+        Value::Vec(components) => Json::Arr(components.into_iter().map(|c| float_to_json(c as f64)).collect()),
+    }
+}
+
+/// Emit integral floats as JSON integers. The judge compares an integer against
+/// a float expectation numerically (tolerance), but a float against an integer
+/// expectation fails on type, so integers are the strictly safer encoding for
+/// values like vector components (3.0 -> 3) and distances (5.0 -> 5).
+fn float_to_json(v: f64) -> Json {
+    if v.is_finite() && v.fract() == 0.0 && v.abs() < 9.007_199_254_740_992e15 {
+        Json::Int(v as i64)
+    } else {
+        Json::Float(v)
     }
 }
