@@ -67,7 +67,9 @@ impl Engine {
                 }
                 Ok(ExecResult::Ack)
             }
-            Stmt::CreateTable { name, columns } => self.mutate(|e| e.create_table(&name, &columns)),
+            Stmt::CreateTable { name, columns, if_not_exists } => {
+                self.mutate(|e| e.create_table(&name, &columns, if_not_exists))
+            }
             Stmt::CreateVectorIndex { index_name, table, column } => {
                 self.mutate(|e| e.create_vector_index(&index_name, &table, &column))
             }
@@ -77,8 +79,8 @@ impl Engine {
             }
             Stmt::Update { table, sets, filter } => self.mutate(|e| e.update(&table, &sets, filter.as_ref())),
             Stmt::Delete { table, filter } => self.mutate(|e| e.delete(&table, filter.as_ref())),
-            Stmt::Select { items, table, filter, order_by, limit } => {
-                self.select(&items, &table, filter.as_ref(), &order_by, limit)
+            Stmt::Select { items, table, filter, order_by, limit, offset } => {
+                self.select(&items, &table, filter.as_ref(), &order_by, limit, offset)
             }
         }
     }
@@ -121,8 +123,16 @@ impl Engine {
             .ok_or_else(|| DbError::new(ERR_TABLE_NOT_FOUND, format!("table {} does not exist", name)))
     }
 
-    fn create_table(&mut self, name: &str, specs: &[ColumnSpec]) -> DbResult<ExecResult> {
+    fn create_table(
+        &mut self,
+        name: &str,
+        specs: &[ColumnSpec],
+        if_not_exists: bool,
+    ) -> DbResult<ExecResult> {
         if self.storage.table(name).is_some() {
+            if if_not_exists {
+                return Ok(ExecResult::Ack);
+            }
             return Err(DbError::new("table_exists", format!("table {} already exists", name)));
         }
         if specs.is_empty() {
@@ -405,11 +415,13 @@ impl Engine {
         filter: Option<&Expr>,
         order_by: &[crate::sql::ast::OrderKey],
         limit: Option<usize>,
+        offset: usize,
     ) -> DbResult<Option<ExecResult>> {
         let limit = match limit {
             Some(l) => l,
             None => return Ok(None),
         };
+        let wanted = offset.saturating_add(limit);
         if order_by.len() != 1 || order_by[0].desc {
             return Ok(None);
         }
@@ -505,7 +517,12 @@ impl Engine {
                 Some(c) => c,
                 None => return Ok(None),
             };
-            cache.topk(&query, limit, candidates.as_deref())
+            cache.topk(&query, wanted, candidates.as_deref())
+        };
+        let scored: Vec<(i64, f64)> = if offset >= scored.len() {
+            Vec::new()
+        } else {
+            scored[offset..].to_vec()
         };
         let mut columns = Vec::with_capacity(items.len());
         for item in items {
@@ -542,6 +559,7 @@ impl Engine {
         filter: Option<&Expr>,
         order_by: &[crate::sql::ast::OrderKey],
         limit: Option<usize>,
+        offset: usize,
     ) -> DbResult<ExecResult> {
         let table = self.require_table(table_name)?;
         let items = exec::expand_items(items, &table);
@@ -550,7 +568,38 @@ impl Engine {
             columns.push(exec::projection_name(item, &table)?);
         }
 
-        if let Some(result) = self.try_vector_fast_path(&items, &table, filter, order_by, limit)? {
+        // Primary-key equality shortcut: WHERE id = <literal> must not scan the
+        // whole table (this dominated recovery/resource cases at >=1M rows).
+        if let Some(cond) = filter {
+            if let Some((eq_col, Value::Int(pk))) = Self::simple_equality(cond, &table) {
+                if eq_col == table.pk {
+                    let mut rows: Vec<Row> = Vec::new();
+                    if let Some(row) = self.storage.get(table.id, pk)? {
+                        if limit != Some(0) && offset == 0 {
+                            let mut projected = Vec::with_capacity(items.len());
+                            for item in &items {
+                                match item {
+                                    SelectItem::Star => {}
+                                    SelectItem::Column { name } => {
+                                        let idx = exec::resolve_column(&table, name)?;
+                                        projected.push(row[idx].clone());
+                                    }
+                                    SelectItem::Expr { expr, .. } => {
+                                        projected.push(exec::eval(expr, &table, Some(&row))?);
+                                    }
+                                }
+                            }
+                            rows.push(projected);
+                        }
+                    }
+                    return Ok(ExecResult::Query { columns, rows });
+                }
+            }
+        }
+
+        if let Some(result) =
+            self.try_vector_fast_path(&items, &table, filter, order_by, limit, offset)?
+        {
             return Ok(result);
         }
 
@@ -560,9 +609,27 @@ impl Engine {
             keys: Vec<Value>,
         }
 
+        fn row_greater(a: &OutRow, b: &OutRow, order_by: &[crate::sql::ast::OrderKey]) -> bool {
+            for (i, key) in order_by.iter().enumerate() {
+                let ord = exec::order_cmp(&a.keys[i], &b.keys[i]);
+                let ord = if key.desc { ord.reverse() } else { ord };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord == std::cmp::Ordering::Greater;
+                }
+            }
+            a.pk > b.pk
+        }
+
         let mut out: Vec<OutRow> = Vec::new();
         let stop_early = order_by.is_empty() && limit.is_some();
-        let limit_value = limit.unwrap_or(usize::MAX);
+        // Ordered + LIMIT queries keep only the best cap rows, so a scan over a
+        // huge table cannot materialise the whole result set in memory.
+        let keep_cap: Option<usize> = if order_by.is_empty() {
+            None
+        } else {
+            limit.map(|l| l.saturating_add(offset))
+        };
+        let limit_value = limit.unwrap_or(usize::MAX).saturating_add(offset);
         let mut error: Option<DbError> = None;
         {
             let table_ref = &table;
@@ -612,7 +679,25 @@ impl Engine {
                         }
                     }
                 }
-                out.push(OutRow { pk, projected, keys });
+                let candidate = OutRow { pk, projected, keys };
+                match keep_cap {
+                    Some(cap) => {
+                        if out.len() < cap {
+                            out.push(candidate);
+                        } else if cap > 0 {
+                            let mut worst = 0usize;
+                            for i in 1..out.len() {
+                                if row_greater(&out[i], &out[worst], order_ref) {
+                                    worst = i;
+                                }
+                            }
+                            if row_greater(&out[worst], &candidate, order_ref) {
+                                out[worst] = candidate;
+                            }
+                        }
+                    }
+                    None => out.push(candidate),
+                }
                 if stop_early && out.len() >= limit_value {
                     return false;
                 }
@@ -634,6 +719,13 @@ impl Engine {
                 }
                 a.pk.cmp(&b.pk)
             });
+        }
+        if offset > 0 {
+            if offset >= out.len() {
+                out.clear();
+            } else {
+                out.drain(0..offset);
+            }
         }
         if let Some(limit) = limit {
             out.truncate(limit);

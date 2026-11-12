@@ -29,7 +29,8 @@ pub const KIND_ROW: u32 = 1;
 /// Hard cap for one WAL record; keeps recovery away from absurd allocations.
 pub const MAX_WAL_RECORD: u64 = 1024 * 1024 * 1024;
 
-/// Magic of the checkpoint catalog file ("MVCA").
+/// Magic of the checkpoint catalog file ("MVCA"); kept for format stability.
+#[allow(dead_code)]
 pub const CATALOG_MAGIC: u32 = 0x4D56_4341;
 /// Magic of the checkpoint index file ("MVID").
 pub const INDEX_MAGIC: u32 = 0x4D56_4944;
@@ -751,9 +752,12 @@ pub struct Slot {
     pub len: u32,
 }
 
-pub fn write_index_body<W: Write>(writer: &mut W, tables: &[(u32, &[Slot])]) -> io::Result<()> {
+pub fn write_index_body<W: Write>(
+    writer: &mut W,
+    tables: &[(u32, &[Slot], &[i64])],
+) -> io::Result<()> {
     writer.write_all(&(tables.len() as u32).to_le_bytes())?;
-    for (table_id, slots) in tables {
+    for (table_id, slots, tombstones) in tables {
         writer.write_all(&table_id.to_le_bytes())?;
         writer.write_all(&(slots.len() as u64).to_le_bytes())?;
         for slot in *slots {
@@ -761,11 +765,16 @@ pub fn write_index_body<W: Write>(writer: &mut W, tables: &[(u32, &[Slot])]) -> 
             writer.write_all(&slot.off.to_le_bytes())?;
             writer.write_all(&slot.len.to_le_bytes())?;
         }
+        writer.write_all(&(tombstones.len() as u64).to_le_bytes())?;
+        for pk in *tombstones {
+            writer.write_all(&pk.to_le_bytes())?;
+        }
     }
     Ok(())
 }
 
-pub fn read_index_body<R: Read>(reader: &mut R) -> DbResult<Vec<(u32, Vec<Slot>)>> {
+#[allow(clippy::type_complexity)]
+pub fn read_index_body<R: Read>(reader: &mut R) -> DbResult<Vec<(u32, Vec<Slot>, Vec<i64>)>> {
     let table_count = stream_u32(reader)? as usize;
     if table_count > 1_000_000 {
         return Err(corrupt("index has an implausible table count"));
@@ -784,9 +793,77 @@ pub fn read_index_body<R: Read>(reader: &mut R) -> DbResult<Vec<(u32, Vec<Slot>)
             let len = stream_u32(reader)?;
             slots.push(Slot { pk, off, len });
         }
-        tables.push((table_id, slots));
+        let tombstone_count = stream_u64(reader)?;
+        if tombstone_count > 1_000_000_000 {
+            return Err(corrupt("index has an implausible tombstone count"));
+        }
+        let mut tombstones = Vec::with_capacity(tombstone_count.min(1_048_576) as usize);
+        for _ in 0..tombstone_count {
+            tombstones.push(stream_u64(reader)? as i64);
+        }
+        tables.push((table_id, slots, tombstones));
     }
     Ok(tables)
+}
+
+// ---------------------------------------------------------------------------
+// Segment manifest (catalog + ordered live segment list)
+// ---------------------------------------------------------------------------
+
+/// Magic of the segment manifest file ("MVMN").
+pub const MANIFEST_MAGIC: u32 = 0x4D56_4D4E;
+
+#[derive(Clone, Debug, Default)]
+pub struct ManifestBody {
+    pub generation: u64,
+    pub next_segment_id: u64,
+    pub catalog: CatalogImage,
+    pub segments: Vec<(u64, u64)>,
+}
+
+pub fn encode_manifest_body(
+    generation: u64,
+    next_segment_id: u64,
+    catalog: &CatalogImage,
+    segments: &[(u64, u64)],
+) -> Vec<u8> {
+    let catalog_body = encode_catalog(catalog);
+    let mut out = Vec::with_capacity(catalog_body.len() + 32 + segments.len() * 16);
+    out.extend_from_slice(&generation.to_le_bytes());
+    out.extend_from_slice(&next_segment_id.to_le_bytes());
+    out.extend_from_slice(&(catalog_body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&catalog_body);
+    out.extend_from_slice(&(segments.len() as u32).to_le_bytes());
+    for (id, bytes) in segments {
+        out.extend_from_slice(&id.to_le_bytes());
+        out.extend_from_slice(&bytes.to_le_bytes());
+    }
+    out
+}
+
+pub fn decode_manifest_body(body: &[u8]) -> DbResult<ManifestBody> {
+    let mut cursor = Cursor::new(body);
+    let generation = cursor.u64()?;
+    let next_segment_id = cursor.u64()?;
+    let catalog_len = cursor.u32()? as usize;
+    if catalog_len as u64 > MAX_CATALOG_BODY {
+        return Err(corrupt("manifest catalog is implausibly large"));
+    }
+    let catalog = decode_catalog(cursor.take(catalog_len)?)?;
+    let segment_count = cursor.u32()? as usize;
+    if segment_count > 10_000_000 {
+        return Err(corrupt("manifest has an implausible segment count"));
+    }
+    let mut segments = Vec::with_capacity(segment_count.min(4096));
+    for _ in 0..segment_count {
+        let id = cursor.u64()?;
+        let bytes = cursor.u64()?;
+        segments.push((id, bytes));
+    }
+    if !cursor.empty() {
+        return Err(corrupt("manifest body has trailing bytes"));
+    }
+    Ok(ManifestBody { generation, next_segment_id, catalog, segments })
 }
 
 // ---------------------------------------------------------------------------
@@ -912,13 +989,33 @@ mod tests {
             Slot { pk: -1, off: 0, len: 16 },
             Slot { pk: 2, off: 32, len: 24 },
         ];
-        let tables: Vec<(u32, &[Slot])> = vec![(3, slots.as_slice())];
+        let tombstones = vec![-7i64, 5];
+        let tables: Vec<(u32, &[Slot], &[i64])> =
+            vec![(3, slots.as_slice(), tombstones.as_slice())];
         let mut body = Vec::new();
         write_index_body(&mut body, &tables).unwrap();
         let decoded = read_index_body(&mut body.as_slice()).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].0, 3);
         assert_eq!(decoded[0].1, slots);
+        assert_eq!(decoded[0].2, tombstones);
+    }
+
+    #[test]
+    fn manifest_body_roundtrip() {
+        let image = CatalogImage {
+            tables: vec![sample_table()],
+            indexes: vec![(7, 2)],
+            next_table_id: 7,
+        };
+        let segments = vec![(1u64, 1024u64), (9, 256 * 1024)];
+        let body = encode_manifest_body(42, 10, &image, &segments);
+        let decoded = decode_manifest_body(&body).unwrap();
+        assert_eq!(decoded.generation, 42);
+        assert_eq!(decoded.next_segment_id, 10);
+        assert_eq!(decoded.catalog.tables.len(), 1);
+        assert_eq!(decoded.catalog.indexes, vec![(7, 2)]);
+        assert_eq!(decoded.segments, segments);
     }
 
     #[test]

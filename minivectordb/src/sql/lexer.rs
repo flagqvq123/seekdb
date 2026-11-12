@@ -5,7 +5,9 @@ use crate::types::{DbError, DbResult};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Ident(String),
-    Number(i64),
+    /// Integer literal kept as i128 so that i64::MIN can be written as
+    /// -9223372036854775808 (the magnitude alone does not fit in i64).
+    Number(i128),
     Str(String),
     LParen,
     RParen,
@@ -142,12 +144,42 @@ pub fn tokenize(sql: &str) -> DbResult<Vec<Tok>> {
                         i += 1;
                         break;
                     }
+                    // MySQL-style backslash escapes inside string literals.
+                    if ch == '\\' && i + 1 < chars.len() {
+                        let next = chars[i + 1];
+                        let mapped = match next {
+                            '0' => Some('\u{0}'),
+                            'b' => Some('\u{08}'),
+                            'n' => Some('\n'),
+                            'r' => Some('\r'),
+                            't' => Some('\t'),
+                            'Z' => Some('\u{1a}'),
+                            '\\' => Some('\\'),
+                            '\'' => Some('\''),
+                            '"' => Some('"'),
+                            _ => None,
+                        };
+                        match mapped {
+                            Some(value) => {
+                                s.push(value);
+                                i += 2;
+                                continue;
+                            }
+                            // Unknown escape: keep the backslash literally.
+                            None => {
+                                s.push(ch);
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
                     s.push(ch);
                     i += 1;
                 }
                 out.push(Tok::Str(s));
             }
-            '"' => {
+            '"' | '`' => {
+                let quote = c;
                 let mut s = String::new();
                 i += 1;
                 loop {
@@ -155,7 +187,13 @@ pub fn tokenize(sql: &str) -> DbResult<Vec<Tok>> {
                         return Err(DbError::syntax("unterminated identifier"));
                     }
                     let ch = chars[i];
-                    if ch == '"' {
+                    if ch == quote {
+                        // doubled quote escapes itself, like SQL standards
+                        if i + 1 < chars.len() && chars[i + 1] == quote {
+                            s.push(quote);
+                            i += 2;
+                            continue;
+                        }
                         i += 1;
                         break;
                     }
@@ -177,7 +215,7 @@ pub fn tokenize(sql: &str) -> DbResult<Vec<Tok>> {
                     return Err(DbError::syntax(format!("real literals are not supported: {}", text)));
                 }
                 let text: String = chars[start..i].iter().collect();
-                match text.parse::<i64>() {
+                match text.parse::<i128>() {
                     Ok(v) => out.push(Tok::Number(v)),
                     Err(_) => return Err(DbError::syntax(format!("integer literal out of range: {}", text))),
                 }

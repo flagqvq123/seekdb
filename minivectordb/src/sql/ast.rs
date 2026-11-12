@@ -7,6 +7,7 @@ pub enum Stmt {
     CreateTable {
         name: String,
         columns: Vec<ColumnSpec>,
+        if_not_exists: bool,
     },
     CreateVectorIndex {
         index_name: String,
@@ -38,6 +39,7 @@ pub enum Stmt {
         filter: Option<Expr>,
         order_by: Vec<OrderKey>,
         limit: Option<usize>,
+        offset: usize,
     },
     Begin,
     Commit,

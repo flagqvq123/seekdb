@@ -288,6 +288,15 @@ pub fn order_value(
     items: &[SelectItem],
     projected: &[Value],
 ) -> DbResult<Value> {
+    // ORDER BY <ordinal> refers to the 1-based position in the SELECT list.
+    if let Expr::Lit(Value::Int(position)) = &key.expr {
+        let index = *position;
+        if index >= 1 && (index as usize) <= items.len() {
+            if let Some(v) = projected.get(index as usize - 1) {
+                return Ok(v.clone());
+            }
+        }
+    }
     if let Expr::Column(name) = &key.expr {
         for (i, item) in items.iter().enumerate() {
             if let SelectItem::Expr { alias, .. } = item {

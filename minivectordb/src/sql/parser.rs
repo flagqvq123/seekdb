@@ -84,7 +84,8 @@ impl Parser {
     }
     fn number(&mut self) -> DbResult<i64> {
         match self.bump() {
-            Tok::Number(v) => Ok(v),
+            Tok::Number(v) if v >= i64::MIN as i128 && v <= i64::MAX as i128 => Ok(v as i64),
+            Tok::Number(v) => Err(DbError::syntax(format!("integer literal out of range: {}", v))),
             other => Err(DbError::syntax(format!("expected integer, found {:?}", other))),
         }
     }
@@ -166,38 +167,50 @@ impl Parser {
     }
 
     fn create_table(&mut self) -> DbResult<Stmt> {
+        let mut if_not_exists = false;
         if self.eat_kw("if") {
             self.expect_kw("not")?;
             self.expect_kw("exists")?;
+            if_not_exists = true;
         }
         let name = self.ident()?;
         self.expect_tok(&Tok::LParen)?;
-        let mut columns = Vec::new();
+        let mut columns: Vec<ColumnSpec> = Vec::new();
         loop {
-            let col_name = self.ident()?;
-            let ty = self.column_type()?;
-            let mut primary_key = false;
-            loop {
-                if self.eat_kw("primary") {
-                    self.expect_kw("key")?;
-                    primary_key = true;
-                } else if self.eat_kw("not") {
-                    self.expect_kw("null")?;
-                } else if self.eat_kw("null") {
-                } else if self.eat_kw("unique") {
-                    return Err(DbError::unsupported("UNIQUE constraints are not supported"));
-                } else if self.eat_kw("auto_increment") {
-                    return Err(DbError::unsupported("AUTO_INCREMENT is not supported"));
-                } else if self.eat_kw("default") {
-                    // consume one literal and ignore
-                    let _ = self.expr()?;
-                } else if self.eat_kw("comment") {
-                    let _ = self.literal_value()?;
-                } else {
-                    break;
+            if self.is_table_constraint() {
+                self.table_constraint(&mut columns)?;
+            } else {
+                let col_name = self.ident()?;
+                let ty = self.column_type()?;
+                let mut primary_key = false;
+                loop {
+                    if self.eat_kw("primary") {
+                        self.expect_kw("key")?;
+                        primary_key = true;
+                    } else if self.eat_kw("not") {
+                        self.expect_kw("null")?;
+                    } else if self.eat_kw("null") {
+                    } else if self.eat_kw("unique") {
+                        self.eat_kw("key");
+                    } else if self.eat_kw("auto_increment") {
+                        return Err(DbError::unsupported("AUTO_INCREMENT is not supported"));
+                    } else if self.eat_kw("default") {
+                        let _ = self.expr()?;
+                    } else if self.eat_kw("comment") {
+                        let _ = self.literal_value()?;
+                    } else if self.eat_kw("collate") {
+                        let _ = self.ident()?;
+                    } else if self.eat_kw("character") {
+                        self.expect_kw("set")?;
+                        let _ = self.ident()?;
+                    } else if self.eat_kw("charset") {
+                        let _ = self.ident()?;
+                    } else {
+                        break;
+                    }
                 }
+                columns.push(ColumnSpec { name: col_name, ty, primary_key });
             }
-            columns.push(ColumnSpec { name: col_name, ty, primary_key });
             if self.eat_tok(&Tok::Comma) {
                 continue;
             }
@@ -207,7 +220,131 @@ impl Parser {
         if columns.is_empty() {
             return Err(DbError::syntax("CREATE TABLE requires at least one column"));
         }
-        Ok(Stmt::CreateTable { name, columns })
+        self.table_options()?;
+        Ok(Stmt::CreateTable { name, columns, if_not_exists })
+    }
+
+    fn is_table_constraint(&self) -> bool {
+        for kw in ["primary", "unique", "key", "index", "constraint", "foreign", "check"] {
+            if self.is_kw(kw) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Parse a table-level constraint and fold it into the column list where it
+    /// matters (single-column PRIMARY KEY); other constraints are accepted and
+    /// ignored because the competition subset does not use them.
+    fn table_constraint(&mut self, columns: &mut Vec<ColumnSpec>) -> DbResult<()> {
+        if self.eat_kw("constraint") {
+            let _ = self.ident()?;
+        }
+        if self.eat_kw("primary") {
+            self.expect_kw("key")?;
+            self.expect_tok(&Tok::LParen)?;
+            let names = self.ident_list()?;
+            self.expect_tok(&Tok::RParen)?;
+            if names.len() != 1 {
+                return Err(DbError::unsupported("composite primary keys are not supported"));
+            }
+            let target = names[0].to_ascii_lowercase();
+            let mut found = false;
+            for col in columns.iter_mut() {
+                if col.name.eq_ignore_ascii_case(&target) {
+                    col.primary_key = true;
+                    found = true;
+                }
+            }
+            if !found {
+                return Err(DbError::syntax(format!(
+                    "primary key column {} is not defined",
+                    names[0]
+                )));
+            }
+            Ok(())
+        } else if self.eat_kw("unique") {
+            self.eat_kw("key");
+            self.eat_kw("index");
+            if matches!(self.peek(), Tok::Ident(_)) {
+                self.pos += 1;
+            }
+            self.expect_tok(&Tok::LParen)?;
+            let _ = self.ident_list()?;
+            self.expect_tok(&Tok::RParen)?;
+            Ok(())
+        } else if self.eat_kw("key") || self.eat_kw("index") {
+            if matches!(self.peek(), Tok::Ident(_)) {
+                self.pos += 1;
+            }
+            self.expect_tok(&Tok::LParen)?;
+            let _ = self.ident_list()?;
+            self.expect_tok(&Tok::RParen)?;
+            Ok(())
+        } else if self.eat_kw("foreign") {
+            Err(DbError::unsupported("FOREIGN KEY is not supported"))
+        } else if self.eat_kw("check") {
+            self.expect_tok(&Tok::LParen)?;
+            let mut depth = 1usize;
+            while depth > 0 && !self.at_eof() {
+                match self.bump() {
+                    Tok::LParen => depth += 1,
+                    Tok::RParen => depth -= 1,
+                    _ => {}
+                }
+            }
+            Ok(())
+        } else {
+            Err(DbError::syntax("unsupported table constraint"))
+        }
+    }
+
+    fn ident_list(&mut self) -> DbResult<Vec<String>> {
+        let mut out = Vec::new();
+        loop {
+            out.push(self.ident()?);
+            if self.eat_tok(&Tok::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(out)
+    }
+
+    /// Consume trailing MySQL table options (ENGINE=..., DEFAULT CHARSET=...).
+    fn table_options(&mut self) -> DbResult<()> {
+        loop {
+            if self.at_eof() || matches!(self.peek(), Tok::Semi) {
+                return Ok(());
+            }
+            let kw = match self.peek() {
+                Tok::Ident(text) => text.to_ascii_lowercase(),
+                _ => return Err(DbError::syntax("unexpected token after CREATE TABLE")),
+            };
+            let known = matches!(
+                kw.as_str(),
+                "engine"
+                    | "default"
+                    | "charset"
+                    | "collate"
+                    | "comment"
+                    | "auto_increment"
+                    | "row_format"
+                    | "tablespace"
+                    | "partition"
+                    | "compression"
+                    | "key_block_size"
+                    | "avg_row_length"
+                    | "checksum"
+            );
+            if !known {
+                return Err(DbError::syntax(format!("unexpected CREATE TABLE option {}", kw)));
+            }
+            while !self.at_eof() && !matches!(self.peek(), Tok::Semi) {
+                self.pos += 1;
+            }
+            return Ok(());
+        }
     }
 
     fn column_type(&mut self) -> DbResult<ColType> {
@@ -376,14 +513,31 @@ impl Parser {
             }
         }
         let mut limit = None;
+        let mut offset = 0usize;
         if self.eat_kw("limit") {
-            let n = self.number()?;
-            if n < 0 {
+            let first = self.number()?;
+            if first < 0 {
                 return Err(DbError::syntax("negative LIMIT"));
             }
-            limit = Some(n as usize);
+            if self.eat_tok(&Tok::Comma) {
+                let second = self.number()?;
+                if second < 0 {
+                    return Err(DbError::syntax("negative LIMIT"));
+                }
+                offset = first as usize;
+                limit = Some(second as usize);
+            } else {
+                limit = Some(first as usize);
+                if self.eat_kw("offset") {
+                    let value = self.number()?;
+                    if value < 0 {
+                        return Err(DbError::syntax("negative OFFSET"));
+                    }
+                    offset = value as usize;
+                }
+            }
         }
-        Ok(Stmt::Select { items, table, filter, order_by, limit })
+        Ok(Stmt::Select { items, table, filter, order_by, limit, offset })
     }
 
     fn is_reserved_from(name: &str) -> bool {
@@ -396,12 +550,23 @@ impl Parser {
 
     fn literal_value(&mut self) -> DbResult<Value> {
         match self.bump() {
-            Tok::Number(v) => Ok(Value::Int(v)),
-            Tok::Str(s) => Ok(Value::Str(s)),
-            Tok::Minus => {
-                let v = self.number()?;
-                Ok(Value::Int(-v))
+            Tok::Number(v) => {
+                if v > i64::MAX as i128 {
+                    return Err(DbError::syntax(format!("integer literal out of range: {}", v)));
+                }
+                Ok(Value::Int(v as i64))
             }
+            Tok::Str(s) => Ok(Value::Str(s)),
+            Tok::Minus => match self.bump() {
+                Tok::Number(magnitude) => {
+                    let negated = -magnitude;
+                    if negated < i64::MIN as i128 {
+                        return Err(DbError::syntax("integer literal out of range"));
+                    }
+                    Ok(Value::Int(negated as i64))
+                }
+                other => Err(DbError::syntax(format!("expected integer, found {:?}", other))),
+            },
             other => Err(DbError::syntax(format!("expected literal, found {:?}", other))),
         }
     }
@@ -491,6 +656,14 @@ impl Parser {
 
     fn expr_unary(&mut self) -> DbResult<Expr> {
         if self.eat_tok(&Tok::Minus) {
+            if let Tok::Number(magnitude) = self.peek().clone() {
+                self.pos += 1;
+                let negated = -magnitude;
+                if negated < i64::MIN as i128 || negated > i64::MAX as i128 {
+                    return Err(DbError::syntax(format!("integer literal out of range: -{}", magnitude)));
+                }
+                return Ok(Expr::Lit(Value::Int(negated as i64)));
+            }
             let inner = self.expr_unary()?;
             return Ok(match inner {
                 Expr::Lit(Value::Int(v)) => Expr::Lit(Value::Int(-v)),
@@ -505,7 +678,12 @@ impl Parser {
 
     fn expr_primary(&mut self) -> DbResult<Expr> {
         match self.bump() {
-            Tok::Number(v) => Ok(Expr::Lit(Value::Int(v))),
+            Tok::Number(v) => {
+                if v > i64::MAX as i128 {
+                    return Err(DbError::syntax(format!("integer literal out of range: {}", v)));
+                }
+                Ok(Expr::Lit(Value::Int(v as i64)))
+            }
             Tok::Str(s) => Ok(Expr::Lit(Value::Str(s))),
             Tok::LParen => {
                 let e = self.expr()?;

@@ -1,30 +1,35 @@
-//! Durable storage engine: generation-based checkpoints plus a write-ahead log.
+//! Durable storage engine: immutable row segments plus a write-ahead log.
 //!
 //! Layout under the data directory:
 //!
-//!   CURRENT                u64 generation number of the live checkpoint
-//!   ckpt-<gen>.dat         row frames sorted by (table id, primary key)
-//!   ckpt-<gen>.idx         table id -> sorted (pk, frame offset, payload len)
-//!   ckpt-<gen>.cat         catalog snapshot (tables, vector index metadata)
-//!   wal-<gen>.log          committed transactions not yet folded into a ckpt
+//!   MANIFEST               atomic snapshot: catalog, WAL generation, live
+//!                          segment list (oldest -> newest) and next segment id
+//!   seg-<id>.dat           row frames sorted by (table id, primary key)
+//!   seg-<id>.idx           table id -> sorted (pk, frame offset, payload len)
+//!                          plus sorted tombstone primary keys
+//!   wal-<generation>.log   committed transactions not yet written to a segment
 //!
-//! A commit appends one self-describing, checksummed transaction record to the
-//! current WAL and fsyncs it before returning, so an acknowledged commit
-//! survives an immediate kill. A checkpoint merges ckpt + WAL into
-//! ckpt-<gen+1>.*, fsyncs every file, creates an empty wal-<gen+1>.log and only
-//! then atomically switches CURRENT (write CURRENT.tmp, fsync, rename). A crash
-//! anywhere before the switch leaves the previous generation (plus its WAL)
-//! intact; a crash after it leaves the new generation intact and the old files
-//! are garbage collected on the next open. Recovery truncates a torn WAL tail at
-//! the first bad frame and is therefore idempotent.
+//! A commit streams one self-describing, checksummed transaction record into the
+//! current WAL and fsyncs it before returning. When the WAL grows past a
+//! threshold the committed rows are written to a NEW segment and the manifest is
+//! atomically switched (write MANIFEST.tmp, fsync, rename). Old segments are
+//! never rewritten by a flush: a flush costs O(new rows), not O(table size), so
+//! a single COMMIT can never trigger a full-table rewrite.
 //!
-//! Reads are served by a bounded FIFO row cache; cache misses fall back to a
-//! buffered, strictly sequential read of the checkpoint data file. Only the
-//! primary-key -> file-position index and the cache are resident, so tables
-//! larger than memory can still be scanned in primary-key order.
+//! Segment count is bounded by a size-tiered merge: when there are too many
+//! segments, the oldest contiguous run whose total size fits a fixed budget
+//! (a few hundred MB by default) is merged into one new segment. The merge is
+//! bounded per commit and crash safe: the new segment and the new manifest are
+//! fsynced before the manifest switch, and unreferenced files are garbage
+//! collected on the next open.
+//!
+//! Reads merge all live segments (newest wins, tombstones hide older rows) with
+//! the in-memory committed overlay and the current transaction. Only the
+//! primary-key -> file-position index (20 bytes per row) and a bounded FIFO row
+//! cache are resident, so tables larger than memory can still be scanned in
+//! primary-key order with a streaming, buffered read per segment.
 
 use std::cell::RefCell;
-use std::collections::btree_map;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -35,81 +40,181 @@ use super::format::{self, Slot, WalOp};
 use super::Storage;
 use crate::types::{ColumnDef, DbError, DbResult, Row, TableDef, ERR_INTERNAL, ERR_TX_STATE};
 
-const CURRENT_FILE: &str = "CURRENT";
-const CURRENT_TEMP: &str = "CURRENT.tmp";
+const MANIFEST_FILE: &str = "MANIFEST";
+const MANIFEST_TEMP: &str = "MANIFEST.tmp";
 
-/// Bytes of WAL tolerated before a checkpoint is forced. A checkpoint rewrites
-/// the whole data set synchronously inside the triggering COMMIT, so the limit
-/// is deliberately high enough that ordinary judge workloads never hit it.
-const DEFAULT_CHECKPOINT_BYTES: u64 = 512 * 1024 * 1024;
-/// Committed rows tolerated in memory before a checkpoint is forced.
-const DEFAULT_CHECKPOINT_ROWS: usize = 4 * 1024 * 1024;
+/// WAL bytes tolerated before the committed overlay is written to a segment.
+const DEFAULT_WAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Committed rows tolerated in memory before forcing a segment flush.
+const DEFAULT_FLUSH_ROWS: usize = 512 * 1024;
+/// Maximum bytes one merge operation may rewrite (per commit).
+const DEFAULT_MERGE_BYTES: u64 = 128 * 1024 * 1024;
+/// Segment count above which one bounded merge is performed per flush.
+const DEFAULT_TARGET_SEGMENTS: usize = 16;
 /// Default row-cache budget (bytes of decoded rows kept resident).
 const DEFAULT_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const READ_BUFFER: usize = 1 << 20;
+const SEGMENT_READ_BUFFER: usize = 1 << 16;
 const WRITE_BUFFER: usize = 1 << 20;
 
 /// Crash-safe storage engine.
 pub struct DiskStorage {
     dir: PathBuf,
     generation: u64,
+    next_segment_id: u64,
     catalog: Catalog,
-    /// Checkpoint rows: table id -> slots sorted by primary key.
-    base: HashMap<u32, Vec<Slot>>,
-    /// Committed but not yet checkpointed rows. None is a tombstone.
+    /// Live segments, oldest first; later segments shadow earlier ones.
+    segments: Vec<Segment>,
+    /// Committed but not yet written to a segment. None is a tombstone.
     committed: HashMap<u32, BTreeMap<i64, Option<Row>>>,
     committed_rows: usize,
     wal: Wal,
-    data_path: PathBuf,
-    data_file: RefCell<File>,
     cache: RefCell<RowCache>,
     txn: Option<Txn>,
-    checkpoint_bytes: u64,
-    checkpoint_rows: usize,
+    wal_bytes: u64,
+    flush_rows: usize,
+    merge_bytes: u64,
+    target_segments: usize,
+}
+
+/// One immutable segment: rows plus tombstones for every table.
+struct Segment {
+    id: u64,
+    data_bytes: u64,
+    data_path: PathBuf,
+    data_file: RefCell<File>,
+    slots: HashMap<u32, Vec<Slot>>,
+    tombstones: HashMap<u32, Vec<i64>>,
+}
+
+impl Segment {
+    fn open(dir: &Path, id: u64) -> DbResult<Segment> {
+        let data_path = segment_path(dir, id, "dat");
+        let data_file = File::open(&data_path)?;
+        let data_len = data_file.metadata()?.len();
+        let index = read_index_file(&segment_path(dir, id, "idx"))?;
+        let mut slots: HashMap<u32, Vec<Slot>> = HashMap::new();
+        let mut tombstones: HashMap<u32, Vec<i64>> = HashMap::new();
+        for (table_id, table_slots, table_tombstones) in index {
+            let mut previous: Option<i64> = None;
+            for slot in &table_slots {
+                let end = slot.off.saturating_add(format::frame_total_len(slot.len as u64));
+                if end > data_len {
+                    return Err(format::corrupt("segment data file is shorter than its index"));
+                }
+                if let Some(previous) = previous {
+                    if slot.pk <= previous {
+                        return Err(format::corrupt("segment index is not sorted by primary key"));
+                    }
+                }
+                previous = Some(slot.pk);
+            }
+            let mut previous: Option<i64> = None;
+            for pk in &table_tombstones {
+                if let Some(previous) = previous {
+                    if *pk <= previous {
+                        return Err(format::corrupt("segment tombstone list is not sorted"));
+                    }
+                }
+                previous = Some(*pk);
+            }
+            if !table_slots.is_empty() {
+                slots.insert(table_id, table_slots);
+            }
+            if !table_tombstones.is_empty() {
+                tombstones.insert(table_id, table_tombstones);
+            }
+        }
+        Ok(Segment {
+            id,
+            data_bytes: data_len,
+            data_path,
+            data_file: RefCell::new(data_file),
+            slots,
+            tombstones,
+        })
+    }
+
+    fn has_table(&self, table_id: u32) -> bool {
+        self.slots.contains_key(&table_id) || self.tombstones.contains_key(&table_id)
+    }
+
+    fn read_row(&self, slot: Slot) -> DbResult<Row> {
+        let mut file = self.data_file.borrow_mut();
+        file.seek(SeekFrom::Start(slot.off))?;
+        let (kind, payload) = format::read_frame(&mut *file, slot.len)?;
+        if kind != format::KIND_ROW {
+            return Err(format::corrupt("unexpected record kind in segment data file"));
+        }
+        format::decode_row(&payload)
+    }
+
+    fn lookup(&self, table_id: u32, pk: i64) -> Option<Lookup> {
+        if let Some(tombstones) = self.tombstones.get(&table_id) {
+            if tombstones.binary_search(&pk).is_ok() {
+                return Some(Lookup::Deleted);
+            }
+        }
+        if let Some(slots) = self.slots.get(&table_id) {
+            if let Ok(index) = slots.binary_search_by_key(&pk, |slot| slot.pk) {
+                return Some(Lookup::Row(slots[index]));
+            }
+        }
+        None
+    }
+}
+
+enum Lookup {
+    Row(Slot),
+    Deleted,
 }
 
 impl DiskStorage {
     /// Open (or create) a database directory, replaying the WAL before return.
     pub fn open(dir: &Path) -> DbResult<Self> {
         fs::create_dir_all(dir)?;
-        let generation = match read_current(dir)? {
-            Some(generation) => generation,
-            None => {
-                initialize_generation(dir)?;
-                1
-            }
+        let mut storage = match read_manifest(dir)? {
+            Some(manifest) => DiskStorage::from_manifest(dir, manifest)?,
+            None => DiskStorage::initialize(dir)?,
         };
-        let mut storage = DiskStorage::load(dir, generation)?;
         storage.recover()?;
-        storage.remove_stale_files()?;
+        storage.remove_orphans()?;
         Ok(storage)
     }
 
-    /// Build the on-disk/in-memory state for one generation (no WAL replay).
-    fn load(dir: &Path, generation: u64) -> DbResult<Self> {
-        let catalog_body =
-            read_container_file(&checkpoint_path(dir, generation, "cat"), format::CATALOG_MAGIC)?;
-        let catalog = Catalog::from_image(format::decode_catalog(&catalog_body)?);
-        let base = read_index_file(&checkpoint_path(dir, generation, "idx"))?;
-        let data_path = checkpoint_path(dir, generation, "dat");
-        let data_file = File::open(&data_path)?;
-        let data_len = data_file.metadata()?.len();
-        for slots in base.values() {
-            let mut previous: Option<i64> = None;
-            for slot in slots {
-                let end = slot.off.saturating_add(format::frame_total_len(slot.len as u64));
-                if end > data_len {
-                    return Err(format::corrupt("checkpoint data file is shorter than its index"));
-                }
-                if let Some(previous) = previous {
-                    if slot.pk <= previous {
-                        return Err(format::corrupt("checkpoint index is not sorted by primary key"));
-                    }
-                }
-                previous = Some(slot.pk);
-            }
+    /// Fresh data directory: wipe leftovers and write an empty generation 1.
+    fn initialize(dir: &Path) -> DbResult<Self> {
+        remove_all_owned_files(dir)?;
+        let generation = 1u64;
+        let next_segment_id = 1u64;
+        File::create(wal_path(dir, generation))?.sync_all()?;
+        write_manifest(dir, generation, next_segment_id, &format::CatalogImage::default(), &[])?;
+        let wal = Wal::open(&wal_path(dir, generation), 0)?;
+        Ok(DiskStorage {
+            dir: dir.to_path_buf(),
+            generation,
+            next_segment_id,
+            catalog: Catalog::default(),
+            segments: Vec::new(),
+            committed: HashMap::new(),
+            committed_rows: 0,
+            wal,
+            cache: RefCell::new(RowCache::new(cache_budget_from_env())),
+            txn: None,
+            wal_bytes: wal_bytes_from_env(),
+            flush_rows: DEFAULT_FLUSH_ROWS,
+            merge_bytes: merge_bytes_from_env(),
+            target_segments: target_segments_from_env(),
+        })
+    }
+
+    fn from_manifest(dir: &Path, manifest: format::ManifestBody) -> DbResult<Self> {
+        let catalog = Catalog::from_image(manifest.catalog);
+        let mut segments = Vec::with_capacity(manifest.segments.len());
+        for (id, _bytes) in &manifest.segments {
+            segments.push(Segment::open(dir, *id)?);
         }
-        let wal_path = wal_path(dir, generation);
+        let wal_path = wal_path(dir, manifest.generation);
         let wal_len = match fs::metadata(&wal_path) {
             Ok(metadata) => metadata.len(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -121,18 +226,19 @@ impl DiskStorage {
         let wal = Wal::open(&wal_path, wal_len)?;
         Ok(DiskStorage {
             dir: dir.to_path_buf(),
-            generation,
+            generation: manifest.generation,
+            next_segment_id: manifest.next_segment_id,
             catalog,
-            base,
+            segments,
             committed: HashMap::new(),
             committed_rows: 0,
             wal,
-            data_path,
-            data_file: RefCell::new(data_file),
             cache: RefCell::new(RowCache::new(cache_budget_from_env())),
             txn: None,
-            checkpoint_bytes: checkpoint_bytes_from_env(),
-            checkpoint_rows: DEFAULT_CHECKPOINT_ROWS,
+            wal_bytes: wal_bytes_from_env(),
+            flush_rows: DEFAULT_FLUSH_ROWS,
+            merge_bytes: merge_bytes_from_env(),
+            target_segments: target_segments_from_env(),
         })
     }
 
@@ -190,7 +296,6 @@ impl DiskStorage {
             }
         }
         if position < file_len {
-            // Torn tail: drop everything after the last durable record.
             file.set_len(position)?;
             file.sync_all()?;
         }
@@ -198,15 +303,15 @@ impl DiskStorage {
         Ok(())
     }
 
-    /// Remove files that do not belong to the live generation.
-    fn remove_stale_files(&mut self) -> DbResult<()> {
-        let keep = [
-            CURRENT_FILE.to_string(),
-            format!("ckpt-{}.dat", self.generation),
-            format!("ckpt-{}.idx", self.generation),
-            format!("ckpt-{}.cat", self.generation),
-            format!("wal-{}.log", self.generation),
-        ];
+    /// Delete files that are neither referenced by the manifest nor the WAL.
+    fn remove_orphans(&mut self) -> DbResult<()> {
+        let mut keep: Vec<String> = Vec::with_capacity(self.segments.len() * 2 + 2);
+        keep.push(MANIFEST_FILE.to_string());
+        keep.push(file_name(&wal_path(&self.dir, self.generation)));
+        for segment in &self.segments {
+            keep.push(file_name(&segment_path(&self.dir, segment.id, "dat")));
+            keep.push(file_name(&segment_path(&self.dir, segment.id, "idx")));
+        }
         let mut stale = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
@@ -214,8 +319,11 @@ impl DiskStorage {
             if keep.iter().any(|kept| *kept == name) {
                 continue;
             }
-            let ours = name.starts_with("ckpt-")
+            let ours = name.starts_with("seg-")
                 || name.starts_with("wal-")
+                || name.starts_with("ckpt-")
+                || name.starts_with("MANIFEST.")
+                || name == "CURRENT"
                 || name.starts_with("CURRENT.")
                 || name.ends_with(".tmp");
             if ours {
@@ -237,12 +345,10 @@ impl DiskStorage {
                 WalOp::Put { table_id, pk, row } => {
                     self.committed.entry(*table_id).or_default().insert(*pk, Some(row.clone()));
                     self.committed_rows += 1;
-                    self.cache.borrow_mut().remove((*table_id, *pk));
                 }
                 WalOp::Delete { table_id, pk } => {
                     self.committed.entry(*table_id).or_default().insert(*pk, None);
                     self.committed_rows += 1;
-                    self.cache.borrow_mut().remove((*table_id, *pk));
                 }
             }
         }
@@ -263,7 +369,6 @@ impl DiskStorage {
         for ((table_id, pk), value) in txn.writes {
             self.committed.entry(table_id).or_default().insert(pk, value);
             self.committed_rows += 1;
-            self.cache.borrow_mut().remove((table_id, pk));
         }
     }
 
@@ -325,175 +430,23 @@ impl DiskStorage {
             Ok(())
         })?;
         self.apply_ops(ops, self.catalog.next_table_id)?;
-        self.maybe_checkpoint();
+        self.maybe_flush();
         Ok(())
     }
 
-    fn maybe_checkpoint(&mut self) {
+    /// Flush the committed overlay to a new segment once the WAL or the overlay
+    /// crosses its threshold. The flush cost is proportional to the new rows
+    /// only, plus at most one bounded merge.
+    fn maybe_flush(&mut self) {
         if self.txn.is_some() {
             return;
         }
-        if self.wal.len < self.checkpoint_bytes && self.committed_rows < self.checkpoint_rows {
+        if self.wal.len < self.wal_bytes && self.committed_rows < self.flush_rows {
             return;
         }
-        if let Err(err) = self.checkpoint() {
-            eprintln!("minivectordb: checkpoint failed: {}", err);
+        if let Err(err) = self.flush_and_compact() {
+            eprintln!("minivectordb: segment flush failed: {}", err);
         }
-    }
-
-/// Fold the checkpoint plus committed WAL state into generation + 1.
-    fn checkpoint(&mut self) -> DbResult<()> {
-        if self.txn.is_some() {
-            return Ok(());
-        }
-        if self.committed.is_empty() && self.wal.len == 0 {
-            return Ok(());
-        }
-        let new_generation = self.generation + 1;
-        let dat_final = checkpoint_path(&self.dir, new_generation, "dat");
-        let idx_final = checkpoint_path(&self.dir, new_generation, "idx");
-        let cat_final = checkpoint_path(&self.dir, new_generation, "cat");
-        let dat_temp = checkpoint_path(&self.dir, new_generation, "dat.tmp");
-        let idx_temp = checkpoint_path(&self.dir, new_generation, "idx.tmp");
-        let cat_temp = checkpoint_path(&self.dir, new_generation, "cat.tmp");
-
-        let mut new_base: HashMap<u32, Vec<Slot>> = HashMap::with_capacity(self.base.len());
-        {
-            let data_path = self.data_path.clone();
-            let mut reader = RecordReader::open(&data_path)?;
-            let mut scratch: Vec<u8> = Vec::new();
-            let mut data_position = 0u64;
-            let file = File::create(&dat_temp)?;
-            let mut writer = BufWriter::with_capacity(WRITE_BUFFER, file);
-            for def in &self.catalog.tables {
-                let table_id = def.id;
-                let base_slots: &[Slot] =
-                    self.base.get(&table_id).map(|slots| slots.as_slice()).unwrap_or(&[]);
-                let overlay: Option<&BTreeMap<i64, Option<Row>>> = self.committed.get(&table_id);
-                let mut slots: Vec<Slot> = Vec::with_capacity(base_slots.len());
-                let mut overlay_iter = overlay.map(|map| map.iter().peekable());
-                let mut base_index = 0usize;
-                loop {
-                    let base_pk = base_slots.get(base_index).map(|slot| slot.pk);
-                    let overlay_pk =
-                        overlay_iter.as_mut().and_then(|iter| iter.peek().map(|(pk, _)| **pk));
-                    let pk = match (base_pk, overlay_pk) {
-                        (None, None) => break,
-                        (Some(pk), None) => pk,
-                        (None, Some(pk)) => pk,
-                        (Some(base), Some(overlay)) => base.min(overlay),
-                    };
-                    let value: Option<Row> = if overlay_pk == Some(pk) {
-                        let entry = overlay_iter.as_mut().unwrap().next().unwrap();
-                        let value = entry.1.clone();
-                        if base_pk == Some(pk) {
-                            base_index += 1;
-                        }
-                        value
-                    } else {
-                        let slot = base_slots[base_index];
-                        base_index += 1;
-                        Some(reader.read_row(slot)?)
-                    };
-                    if let Some(row) = &value {
-                        scratch.clear();
-                        format::encode_row_into(&mut scratch, row);
-                        format::write_frame(&mut writer, format::KIND_ROW, &scratch)?;
-                        slots.push(Slot { pk, off: data_position, len: scratch.len() as u32 });
-                        data_position += format::frame_total_len(scratch.len() as u64);
-                    }
-                }
-                if !slots.is_empty() {
-                    new_base.insert(table_id, slots);
-                }
-            }
-            let file = writer.into_inner().map_err(|err| DbError::from(err.into_error()))?;
-            file.sync_all()?;
-        }
-
-        write_index_file(&idx_temp, &new_base)?;
-        let catalog_body = format::encode_catalog(&format::CatalogImage {
-            tables: self.catalog.tables.clone(),
-            indexes: self.catalog.indexes.clone(),
-            next_table_id: self.catalog.next_table_id,
-        });
-        write_container_file(&cat_temp, format::CATALOG_MAGIC, &catalog_body)?;
-
-        fs::rename(&dat_temp, &dat_final)?;
-        fs::rename(&idx_temp, &idx_final)?;
-        fs::rename(&cat_temp, &cat_final)?;
-        sync_directory(&self.dir);
-
-        let new_wal_path = wal_path(&self.dir, new_generation);
-        File::create(&new_wal_path)?.sync_all()?;
-
-        // Everything fallible happens before the single atomic switch point.
-        let new_data_file = File::open(&dat_final)?;
-        let new_wal = Wal::open(&new_wal_path, 0)?;
-        write_current(&self.dir, new_generation)?;
-
-        let old_generation = self.generation;
-        self.generation = new_generation;
-        self.base = new_base;
-        self.committed.clear();
-        self.committed_rows = 0;
-        self.data_path = dat_final;
-        self.data_file = RefCell::new(new_data_file);
-        self.cache.borrow_mut().clear();
-        self.wal = new_wal;
-
-        for extension in ["dat", "idx", "cat"] {
-            let _ = fs::remove_file(checkpoint_path(&self.dir, old_generation, extension));
-        }
-        let _ = fs::remove_file(wal_path(&self.dir, old_generation));
-        Ok(())
-    }
-
-    fn read_slot(&self, slot: Slot) -> DbResult<Row> {
-        let mut file = self.data_file.borrow_mut();
-        file.seek(SeekFrom::Start(slot.off))?;
-        let (kind, payload) = format::read_frame(&mut *file, slot.len)?;
-        if kind != format::KIND_ROW {
-            return Err(format::corrupt("unexpected record kind in checkpoint data file"));
-        }
-        format::decode_row(&payload)
-    }
-
-    fn cached_row(&self, table_id: u32, slot: Slot) -> DbResult<Arc<Row>> {
-        let key = (table_id, slot.pk);
-        let cached = self.cache.borrow().get(key);
-        if let Some(row) = cached {
-            return Ok(row);
-        }
-        let row = Arc::new(self.read_slot(slot)?);
-        let size = format::encoded_row_len(&row) + 48;
-        self.cache.borrow_mut().insert(key, Arc::clone(&row), size);
-        Ok(row)
-    }
-
-    fn base_lookup(&self, table_id: u32, pk: i64) -> Option<Slot> {
-        let slots = self.base.get(&table_id)?;
-        match slots.binary_search_by_key(&pk, |slot| slot.pk) {
-            Ok(index) => Some(slots[index]),
-            Err(_) => None,
-        }
-    }
-
-    #[cfg(test)]
-    fn generation(&self) -> u64 {
-        self.generation
-    }
-    #[cfg(test)]
-    fn wal_len(&self) -> u64 {
-        self.wal.len
-    }
-    #[cfg(test)]
-    fn committed_row_count(&self) -> usize {
-        self.committed_rows
-    }
-    #[cfg(test)]
-    fn cached_row_count(&self) -> usize {
-        self.cache.borrow().len()
     }
 }
 
@@ -548,6 +501,14 @@ impl Catalog {
         catalog
     }
 
+    fn image(&self) -> format::CatalogImage {
+        format::CatalogImage {
+            tables: self.tables.clone(),
+            indexes: self.indexes.clone(),
+            next_table_id: self.next_table_id,
+        }
+    }
+
     fn table_by_id(&self, id: u32) -> Option<&TableDef> {
         match self.tables.binary_search_by_key(&id, |def| def.id) {
             Ok(index) => Some(&self.tables[index]),
@@ -582,6 +543,372 @@ impl Catalog {
         if !self.indexes.contains(&(table_id, column)) {
             self.indexes.push((table_id, column));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Segment flush and bounded merge
+// ---------------------------------------------------------------------------
+
+impl DiskStorage {
+
+    /// Write the committed overlay into a new segment, then optionally merge one
+    /// bounded run of old segments. Only new rows plus the merge budget are
+    /// written, so the worst-case commit latency is bounded and independent of
+    /// the total table size.
+    fn flush_and_compact(&mut self) -> DbResult<()> {
+        if self.txn.is_some() {
+            return Ok(());
+        }
+        let need_flush = !self.committed.is_empty();
+        if !need_flush && self.wal.len > 0 {
+            // Never rotate a WAL that still carries data not present in a segment.
+            return Ok(());
+        }
+        let segment_count = self.segments.len() + usize::from(need_flush);
+        let merge_run = if segment_count > self.target_segments {
+            self.select_merge_run()
+        } else {
+            None
+        };
+        if !need_flush && merge_run.is_none() {
+            return Ok(());
+        }
+        let mut next_segment_id = self.next_segment_id;
+        let flushed = if need_flush {
+            let segment = self.write_overlay_segment(next_segment_id)?;
+            next_segment_id += 1;
+            Some(segment)
+        } else {
+            None
+        };
+        let merged = match merge_run {
+            Some((start, end)) => {
+                let segment = self.merge_segment_range(start, end, next_segment_id)?;
+                next_segment_id += 1;
+                Some((start, end, segment))
+            }
+            None => None,
+        };
+        let old_segments = std::mem::take(&mut self.segments);
+        let mut old_slots: Vec<Option<Segment>> = old_segments.into_iter().map(Some).collect();
+        let merge_range = merged.as_ref().map(|(start, end, _)| (*start, *end));
+        let mut merged_segment = merged.map(|(_, _, segment)| segment);
+        let mut removed: Vec<Segment> = Vec::new();
+        let mut final_segments: Vec<Segment> = Vec::with_capacity(old_slots.len() + 2);
+        let mut index = 0usize;
+        while index < old_slots.len() {
+            if let Some((start, end)) = merge_range {
+                if index == start {
+                    for slot in old_slots.iter_mut().take(end).skip(start) {
+                        if let Some(segment) = slot.take() {
+                            removed.push(segment);
+                        }
+                    }
+                    if let Some(segment) = merged_segment.take() {
+                        final_segments.push(segment);
+                    }
+                    index = end;
+                    continue;
+                }
+            }
+            if let Some(segment) = old_slots[index].take() {
+                final_segments.push(segment);
+            }
+            index += 1;
+        }
+        if let Some(segment) = flushed {
+            final_segments.push(segment);
+        }
+        self.publish(next_segment_id, final_segments, removed, need_flush)
+    }
+
+    /// Pick the oldest contiguous run whose size fits the merge budget.
+    fn select_merge_run(&self) -> Option<(usize, usize)> {
+        let count = self.segments.len();
+        if count < 2 {
+            return None;
+        }
+        for start in 0..count {
+            let mut total = self.segments[start].data_bytes;
+            if total > self.merge_bytes {
+                continue;
+            }
+            let mut end = start + 1;
+            while end < count {
+                let next = self.segments[end].data_bytes;
+                if total.saturating_add(next) > self.merge_bytes {
+                    break;
+                }
+                total += next;
+                end += 1;
+            }
+            if end - start >= 2 {
+                return Some((start, end));
+            }
+        }
+        None
+    }
+
+    fn write_overlay_segment(&mut self, id: u64) -> DbResult<Segment> {
+        let mut builder = SegmentBuilder::new(&self.dir, id)?;
+        for table in &self.catalog.tables {
+            let table_id = table.id;
+            let Some(overlay) = self.committed.get(&table_id) else {
+                continue;
+            };
+            for (pk, value) in overlay {
+                match value {
+                    Some(row) => builder.push_row(table_id, *pk, row)?,
+                    None => builder.push_tombstone(table_id, *pk),
+                }
+            }
+        }
+        builder.finish()
+    }
+
+    /// Merge the contiguous run [start, end) of live segments into one segment.
+    /// Newer inputs shadow older ones and tombstones are dropped.
+    fn merge_segment_range(&self, start: usize, end: usize, id: u64) -> DbResult<Segment> {
+        let mut builder = SegmentBuilder::new(&self.dir, id)?;
+        // A tombstone may only be dropped when no older segment survives the
+        // merge, otherwise it must be carried forward to keep hiding old rows.
+        let keep_tombstones = start > 0;
+        let inputs = &self.segments[start..end];
+        for table in &self.catalog.tables {
+            let table_id = table.id;
+            let mut cursors: Vec<SegmentCursor> = Vec::new();
+            for segment in inputs {
+                if !segment.has_table(table_id) {
+                    continue;
+                }
+                cursors.push(SegmentCursor::new(segment, table_id)?);
+            }
+            if cursors.is_empty() {
+                continue;
+            }
+            loop {
+                let mut min_pk: Option<i64> = None;
+                for cursor in &cursors {
+                    if let Some(pk) = cursor.peek() {
+                        min_pk = Some(match min_pk {
+                            Some(current) => current.min(pk),
+                            None => pk,
+                        });
+                    }
+                }
+                let Some(pk) = min_pk else {
+                    break;
+                };
+                let mut chosen_cursor: Option<usize> = None;
+                let mut chosen_slot: Option<Option<Slot>> = None;
+                for cursor_index in (0..cursors.len()).rev() {
+                    if cursors[cursor_index].peek() == Some(pk) {
+                        let entry = cursors[cursor_index].advance();
+                        if chosen_cursor.is_none() {
+                            chosen_cursor = Some(cursor_index);
+                            chosen_slot = Some(entry);
+                        }
+                    }
+                }
+                if let (Some(cursor_index), Some(Some(slot))) = (chosen_cursor, chosen_slot) {
+                    let row = cursors[cursor_index].read_row(slot)?;
+                    builder.push_row(table_id, pk, &row)?;
+                } else if keep_tombstones && chosen_cursor.is_some() {
+                    builder.push_tombstone(table_id, pk);
+                }
+            }
+        }
+        builder.finish()
+    }
+
+    /// Atomically publish a new segment list: new files and a new empty WAL are
+    /// fsynced first, then the manifest rename is the single commit point.
+    fn publish(
+        &mut self,
+        next_segment_id: u64,
+        segments: Vec<Segment>,
+        removed: Vec<Segment>,
+        flushed: bool,
+    ) -> DbResult<()> {
+        let new_generation = self.generation + 1;
+        let new_wal_path = wal_path(&self.dir, new_generation);
+        File::create(&new_wal_path)?.sync_all()?;
+        let new_wal = Wal::open(&new_wal_path, 0)?;
+        let catalog_image = self.catalog.image();
+        let manifest_segments: Vec<(u64, u64)> =
+            segments.iter().map(|segment| (segment.id, segment.data_bytes)).collect();
+        write_manifest(&self.dir, new_generation, next_segment_id, &catalog_image, &manifest_segments)?;
+
+        // ---- single atomic switch point: only infallible work below ----
+        let old_wal_path = self.wal.path.clone();
+        let merged = !removed.is_empty();
+        self.generation = new_generation;
+        self.next_segment_id = next_segment_id;
+        self.segments = segments;
+        self.wal = new_wal;
+        if flushed {
+            self.committed.clear();
+            self.committed_rows = 0;
+        }
+        if merged {
+            self.cache.borrow_mut().clear();
+        }
+        for segment in removed {
+            let id = segment.id;
+            drop(segment);
+            let _ = fs::remove_file(segment_path(&self.dir, id, "dat"));
+            let _ = fs::remove_file(segment_path(&self.dir, id, "idx"));
+        }
+        let _ = fs::remove_file(old_wal_path);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Segment writer and cross-segment cursor
+// ---------------------------------------------------------------------------
+
+/// Streams rows and tombstones into a new segment file, then fsyncs and renames
+/// both the data and the index into place.
+struct SegmentBuilder {
+    id: u64,
+    dir: PathBuf,
+    data_temp: PathBuf,
+    data: Option<BufWriter<File>>,
+    position: u64,
+    slots: HashMap<u32, Vec<Slot>>,
+    tombstones: HashMap<u32, Vec<i64>>,
+    scratch: Vec<u8>,
+}
+
+impl SegmentBuilder {
+    fn new(dir: &Path, id: u64) -> DbResult<SegmentBuilder> {
+        let data_temp = segment_temp_path(dir, id, "dat");
+        let file = File::create(&data_temp)?;
+        Ok(SegmentBuilder {
+            id,
+            dir: dir.to_path_buf(),
+            data_temp,
+            data: Some(BufWriter::with_capacity(WRITE_BUFFER, file)),
+            position: 0,
+            slots: HashMap::new(),
+            tombstones: HashMap::new(),
+            scratch: Vec::new(),
+        })
+    }
+
+    fn push_row(&mut self, table_id: u32, pk: i64, row: &Row) -> DbResult<()> {
+        self.scratch.clear();
+        format::encode_row_into(&mut self.scratch, row);
+        let payload_len = self.scratch.len() as u32;
+        let writer = self.data.as_mut().ok_or_else(|| DbError::internal("segment already finished"))?;
+        format::write_frame(writer, format::KIND_ROW, &self.scratch)?;
+        let offset = self.position;
+        self.position += format::frame_total_len(payload_len as u64);
+        self.slots.entry(table_id).or_default().push(Slot { pk, off: offset, len: payload_len });
+        Ok(())
+    }
+
+    fn push_tombstone(&mut self, table_id: u32, pk: i64) {
+        self.tombstones.entry(table_id).or_default().push(pk);
+    }
+
+    fn finish(mut self) -> DbResult<Segment> {
+        let data = self.data.take().ok_or_else(|| DbError::internal("segment already finished"))?;
+        let file = data.into_inner().map_err(|err| DbError::from(err.into_error()))?;
+        file.sync_all()?;
+        drop(file);
+        let data_final = segment_path(&self.dir, self.id, "dat");
+        fs::rename(&self.data_temp, &data_final)?;
+        let index_temp = segment_temp_path(&self.dir, self.id, "idx");
+        write_index_file(&index_temp, &self.slots, &self.tombstones)?;
+        let index_final = segment_path(&self.dir, self.id, "idx");
+        fs::rename(&index_temp, &index_final)?;
+        sync_directory(&self.dir);
+        let data_file = File::open(&data_final)?;
+        Ok(Segment {
+            id: self.id,
+            data_bytes: self.position,
+            data_path: data_final,
+            data_file: RefCell::new(data_file),
+            slots: self.slots,
+            tombstones: self.tombstones,
+        })
+    }
+}
+
+/// Sorted cursor over one segment for a single table: merges the row slots and
+/// the tombstone list so callers see one ascending primary-key stream.
+struct SegmentCursor<'a> {
+    segment_id: u64,
+    reader: RecordReader,
+    slots: &'a [Slot],
+    tombstones: &'a [i64],
+    slot_index: usize,
+    tombstone_index: usize,
+}
+
+impl<'a> SegmentCursor<'a> {
+    fn new(segment: &'a Segment, table_id: u32) -> DbResult<SegmentCursor<'a>> {
+        Ok(SegmentCursor {
+            segment_id: segment.id,
+            reader: RecordReader::open(&segment.data_path)?,
+            slots: segment.slots.get(&table_id).map(|slots| slots.as_slice()).unwrap_or(&[]),
+            tombstones: segment
+                .tombstones
+                .get(&table_id)
+                .map(|tombstones| tombstones.as_slice())
+                .unwrap_or(&[]),
+            slot_index: 0,
+            tombstone_index: 0,
+        })
+    }
+
+    fn peek(&self) -> Option<i64> {
+        let slot_pk = self.slots.get(self.slot_index).map(|slot| slot.pk);
+        let tombstone_pk = self.tombstones.get(self.tombstone_index).copied();
+        match (slot_pk, tombstone_pk) {
+            (Some(row), Some(tombstone)) => Some(row.min(tombstone)),
+            (Some(row), None) => Some(row),
+            (None, Some(tombstone)) => Some(tombstone),
+            (None, None) => None,
+        }
+    }
+
+    fn advance(&mut self) -> Option<Slot> {
+        let slot_pk = self.slots.get(self.slot_index).map(|slot| slot.pk);
+        let tombstone_pk = self.tombstones.get(self.tombstone_index).copied();
+        match (slot_pk, tombstone_pk) {
+            (Some(row), Some(tombstone)) => {
+                if row <= tombstone {
+                    let slot = self.slots[self.slot_index];
+                    self.slot_index += 1;
+                    Some(slot)
+                } else {
+                    self.tombstone_index += 1;
+                    None
+                }
+            }
+            (Some(_), None) => {
+                let slot = self.slots[self.slot_index];
+                self.slot_index += 1;
+                Some(slot)
+            }
+            (None, Some(_)) => {
+                self.tombstone_index += 1;
+                None
+            }
+            (None, None) => None,
+        }
+    }
+
+    fn read_row(&mut self, slot: Slot) -> DbResult<Row> {
+        self.reader.read_row(slot)
+    }
+
+    fn segment_id(&self) -> u64 {
+        self.segment_id
     }
 }
 
@@ -645,14 +972,14 @@ impl Wal {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded FIFO row cache
+// Bounded FIFO row cache (keyed by segment id so merges never return stale rows)
 // ---------------------------------------------------------------------------
 
 struct RowCache {
     budget: usize,
     used: usize,
-    rows: HashMap<(u32, i64), (Arc<Row>, usize)>,
-    order: VecDeque<(u32, i64)>,
+    rows: HashMap<(u64, u32, i64), (Arc<Row>, usize)>,
+    order: VecDeque<(u64, u32, i64)>,
 }
 
 impl RowCache {
@@ -665,11 +992,11 @@ impl RowCache {
         self.rows.len()
     }
 
-    fn get(&self, key: (u32, i64)) -> Option<Arc<Row>> {
+    fn get(&self, key: (u64, u32, i64)) -> Option<Arc<Row>> {
         self.rows.get(&key).map(|(row, _)| Arc::clone(row))
     }
 
-    fn insert(&mut self, key: (u32, i64), row: Arc<Row>, size: usize) {
+    fn insert(&mut self, key: (u64, u32, i64), row: Arc<Row>, size: usize) {
         if self.budget == 0 || size > self.budget {
             return;
         }
@@ -688,12 +1015,6 @@ impl RowCache {
         }
     }
 
-    fn remove(&mut self, key: (u32, i64)) {
-        if let Some((_, size)) = self.rows.remove(&key) {
-            self.used = self.used.saturating_sub(size);
-        }
-    }
-
     fn clear(&mut self) {
         self.rows.clear();
         self.order.clear();
@@ -702,7 +1023,7 @@ impl RowCache {
 }
 
 // ---------------------------------------------------------------------------
-// Buffered sequential reader for the checkpoint data file
+// Buffered sequential reader for segment data files
 // ---------------------------------------------------------------------------
 
 struct RecordReader {
@@ -713,7 +1034,7 @@ struct RecordReader {
 impl RecordReader {
     fn open(path: &Path) -> DbResult<RecordReader> {
         Ok(RecordReader {
-            reader: BufReader::with_capacity(READ_BUFFER, File::open(path)?),
+            reader: BufReader::with_capacity(SEGMENT_READ_BUFFER, File::open(path)?),
             position: 0,
         })
     }
@@ -725,7 +1046,7 @@ impl RecordReader {
         }
         let (kind, payload) = format::read_frame(&mut self.reader, slot.len)?;
         if kind != format::KIND_ROW {
-            return Err(format::corrupt("unexpected record kind in checkpoint data file"));
+            return Err(format::corrupt("unexpected record kind in segment data file"));
         }
         self.position += format::frame_total_len(slot.len as u64);
         format::decode_row(&payload)
@@ -733,15 +1054,23 @@ impl RecordReader {
 }
 
 // ---------------------------------------------------------------------------
-// File naming and durable directory helpers
+// File naming, manifest and index files
 // ---------------------------------------------------------------------------
 
-fn checkpoint_path(dir: &Path, generation: u64, extension: &str) -> PathBuf {
-    dir.join(format!("ckpt-{}.{}", generation, extension))
+fn segment_path(dir: &Path, id: u64, extension: &str) -> PathBuf {
+    dir.join(format!("seg-{}.{}", id, extension))
+}
+
+fn segment_temp_path(dir: &Path, id: u64, extension: &str) -> PathBuf {
+    dir.join(format!("seg-{}.{}.tmp", id, extension))
 }
 
 fn wal_path(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("wal-{}.log", generation))
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 fn cache_budget_from_env() -> usize {
@@ -754,47 +1083,76 @@ fn cache_budget_from_env() -> usize {
     }
 }
 
-fn checkpoint_bytes_from_env() -> u64 {
-    match std::env::var("MINIVECTORDB_CHECKPOINT_MIB") {
+fn wal_bytes_from_env() -> u64 {
+    match std::env::var("MINIVECTORDB_FLUSH_MIB") {
         Ok(text) => match text.trim().parse::<u64>() {
             Ok(mib) if mib > 0 => mib.saturating_mul(1024 * 1024),
-            _ => DEFAULT_CHECKPOINT_BYTES,
+            _ => DEFAULT_WAL_BYTES,
         },
-        Err(_) => DEFAULT_CHECKPOINT_BYTES,
+        Err(_) => DEFAULT_WAL_BYTES,
     }
 }
 
-fn read_current(dir: &Path) -> DbResult<Option<u64>> {
-    match fs::read_to_string(dir.join(CURRENT_FILE)) {
-        Ok(text) => text
-            .trim()
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|_| format::corrupt("CURRENT file is corrupt")),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
+fn merge_bytes_from_env() -> u64 {
+    match std::env::var("MINIVECTORDB_MERGE_MIB") {
+        Ok(text) => match text.trim().parse::<u64>() {
+            Ok(mib) if mib > 0 => mib.saturating_mul(1024 * 1024),
+            _ => DEFAULT_MERGE_BYTES,
+        },
+        Err(_) => DEFAULT_MERGE_BYTES,
     }
 }
 
-fn initialize_generation(dir: &Path) -> DbResult<()> {
-    let generation = 1u64;
-    File::create(checkpoint_path(dir, generation, "dat"))?.sync_all()?;
-    let catalog_body = format::encode_catalog(&format::CatalogImage::default());
-    write_container_file(&checkpoint_path(dir, generation, "cat"), format::CATALOG_MAGIC, &catalog_body)?;
-    write_index_file(&checkpoint_path(dir, generation, "idx"), &HashMap::new())?;
-    File::create(wal_path(dir, generation))?.sync_all()?;
-    write_current(dir, generation)
+fn target_segments_from_env() -> usize {
+    match std::env::var("MINIVECTORDB_SEGMENTS") {
+        Ok(text) => match text.trim().parse::<usize>() {
+            Ok(count) if count >= 2 => count,
+            _ => DEFAULT_TARGET_SEGMENTS,
+        },
+        Err(_) => DEFAULT_TARGET_SEGMENTS,
+    }
 }
 
-fn write_current(dir: &Path, generation: u64) -> DbResult<()> {
-    let temp = dir.join(CURRENT_TEMP);
-    {
-        let mut file = File::create(&temp)?;
-        file.write_all(format!("{}\n", generation).as_bytes())?;
-        file.sync_all()?;
+fn read_manifest(dir: &Path) -> DbResult<Option<format::ManifestBody>> {
+    if !dir.join(MANIFEST_FILE).exists() {
+        return Ok(None);
     }
-    fs::rename(&temp, dir.join(CURRENT_FILE))?;
+    let body = read_container_file(&dir.join(MANIFEST_FILE), format::MANIFEST_MAGIC)?;
+    Ok(Some(format::decode_manifest_body(&body)?))
+}
+
+fn write_manifest(
+    dir: &Path,
+    generation: u64,
+    next_segment_id: u64,
+    catalog: &format::CatalogImage,
+    segments: &[(u64, u64)],
+) -> DbResult<()> {
+    let body = format::encode_manifest_body(generation, next_segment_id, catalog, segments);
+    let temp = dir.join(MANIFEST_TEMP);
+    write_container_file(&temp, format::MANIFEST_MAGIC, &body)?;
+    fs::rename(&temp, dir.join(MANIFEST_FILE))?;
     sync_directory(dir);
+    Ok(())
+}
+
+/// Remove every file this engine may have created (used only for a directory
+/// without a manifest, i.e. a fresh database or an interrupted initialization).
+fn remove_all_owned_files(dir: &Path) -> DbResult<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ours = name.starts_with("seg-")
+            || name.starts_with("wal-")
+            || name.starts_with("ckpt-")
+            || name.starts_with("MANIFEST")
+            || name == "CURRENT"
+            || name.starts_with("CURRENT.")
+            || name.ends_with(".tmp");
+        if ours {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
     Ok(())
 }
 
@@ -827,35 +1185,53 @@ fn read_container_file(path: &Path, magic: u32) -> DbResult<Vec<u8>> {
     let mut header_bytes = [0u8; format::CONTAINER_HEADER_LEN];
     file.read_exact(&mut header_bytes)?;
     let header = format::parse_container_header(&header_bytes, magic)
-        .ok_or_else(|| format::corrupt("bad checkpoint file magic"))?;
+        .ok_or_else(|| format::corrupt("bad container magic"))?;
     if header.version != format::CONTAINER_VERSION {
-        return Err(format::corrupt("unsupported checkpoint version"));
+        return Err(format::corrupt("unsupported container version"));
     }
     if header.body_len > format::MAX_CATALOG_BODY {
-        return Err(format::corrupt("checkpoint body is implausibly large"));
+        return Err(format::corrupt("container body is implausibly large"));
     }
     if header.body_len > file_len.saturating_sub(format::CONTAINER_HEADER_LEN as u64) {
-        return Err(format::corrupt("checkpoint body is truncated"));
+        return Err(format::corrupt("container body is truncated"));
     }
     let mut body = vec![0u8; header.body_len as usize];
     file.read_exact(&mut body)?;
     if format::crc32(&body) != header.crc {
-        return Err(format::corrupt("checkpoint body checksum mismatch"));
+        return Err(format::corrupt("container body checksum mismatch"));
     }
     Ok(body)
 }
 
-fn write_index_file(path: &Path, base: &HashMap<u32, Vec<Slot>>) -> DbResult<()> {
+fn write_index_file(
+    path: &Path,
+    slots: &HashMap<u32, Vec<Slot>>,
+    tombstones: &HashMap<u32, Vec<i64>>,
+) -> DbResult<()> {
     let mut file = File::create(path)?;
     file.write_all(&[0u8; format::CONTAINER_HEADER_LEN])?;
     let (body_len, body_crc) = {
-        let mut tables: Vec<(&u32, &Vec<Slot>)> =
-            base.iter().filter(|(_, slots)| !slots.is_empty()).collect();
-        tables.sort_by_key(|(table_id, _)| **table_id);
-        let slices: Vec<(u32, &[Slot])> =
-            tables.iter().map(|(table_id, slots)| (**table_id, slots.as_slice())).collect();
+        let mut table_ids: Vec<u32> = slots.keys().copied().collect();
+        for table_id in tombstones.keys() {
+            if !table_ids.contains(table_id) {
+                table_ids.push(*table_id);
+            }
+        }
+        table_ids.sort_unstable();
+        let empty_slots: &[Slot] = &[];
+        let empty_tombstones: &[i64] = &[];
+        let tables: Vec<(u32, &[Slot], &[i64])> = table_ids
+            .iter()
+            .map(|table_id| {
+                (
+                    *table_id,
+                    slots.get(table_id).map(|list| list.as_slice()).unwrap_or(empty_slots),
+                    tombstones.get(table_id).map(|list| list.as_slice()).unwrap_or(empty_tombstones),
+                )
+            })
+            .collect();
         let mut writer = format::CrcWriter::new(BufWriter::with_capacity(WRITE_BUFFER, &mut file));
-        format::write_index_body(&mut writer, &slices)?;
+        format::write_index_body(&mut writer, &tables)?;
         let (mut buffered, written, checksum) = writer.finish();
         buffered.flush()?;
         (written, checksum)
@@ -866,34 +1242,200 @@ fn write_index_file(path: &Path, base: &HashMap<u32, Vec<Slot>>) -> DbResult<()>
     Ok(())
 }
 
-fn read_index_file(path: &Path) -> DbResult<HashMap<u32, Vec<Slot>>> {
+#[allow(clippy::type_complexity)]
+fn read_index_file(path: &Path) -> DbResult<Vec<(u32, Vec<Slot>, Vec<i64>)>> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut header_bytes = [0u8; format::CONTAINER_HEADER_LEN];
     file.read_exact(&mut header_bytes)?;
     let header = format::parse_container_header(&header_bytes, format::INDEX_MAGIC)
-        .ok_or_else(|| format::corrupt("bad index magic"))?;
+        .ok_or_else(|| format::corrupt("bad segment index magic"))?;
     if header.version != format::CONTAINER_VERSION {
-        return Err(format::corrupt("unsupported index version"));
+        return Err(format::corrupt("unsupported segment index version"));
     }
     if header.body_len > file_len.saturating_sub(format::CONTAINER_HEADER_LEN as u64) {
-        return Err(format::corrupt("checkpoint index is truncated"));
+        return Err(format::corrupt("segment index is truncated"));
     }
-    let mut base = HashMap::new();
-    {
+    let tables = {
         let reader = BufReader::with_capacity(READ_BUFFER, &mut file);
         let mut crc_reader = format::CrcReader::new(reader, header.body_len);
         let tables = format::read_index_body(&mut crc_reader)?;
         let leftover = crc_reader.remaining();
         let (_, checksum) = crc_reader.finish();
         if leftover != 0 || checksum != header.crc {
-            return Err(format::corrupt("checkpoint index checksum mismatch"));
+            return Err(format::corrupt("segment index checksum mismatch"));
         }
-        for (table_id, slots) in tables {
-            base.insert(table_id, slots);
+        tables
+    };
+    Ok(tables)
+}
+
+// ---------------------------------------------------------------------------
+// Read path
+// ---------------------------------------------------------------------------
+
+impl DiskStorage {
+    fn cached_segment_row(&self, segment: &Segment, table_id: u32, slot: Slot) -> DbResult<Arc<Row>> {
+        let key = (segment.id, table_id, slot.pk);
+        let cached = self.cache.borrow().get(key);
+        if let Some(row) = cached {
+            return Ok(row);
         }
+        let row = Arc::new(segment.read_row(slot)?);
+        let size = format::encoded_row_len(&row) + 48;
+        self.cache.borrow_mut().insert(key, Arc::clone(&row), size);
+        Ok(row)
     }
-    Ok(base)
+
+    fn cached_cursor_row(
+        &self,
+        cursor: &mut SegmentCursor,
+        table_id: u32,
+        slot: Slot,
+    ) -> DbResult<Arc<Row>> {
+        let key = (cursor.segment_id(), table_id, slot.pk);
+        let cached = self.cache.borrow().get(key);
+        if let Some(row) = cached {
+            return Ok(row);
+        }
+        let row = Arc::new(cursor.read_row(slot)?);
+        let size = format::encoded_row_len(&row) + 48;
+        self.cache.borrow_mut().insert(key, Arc::clone(&row), size);
+        Ok(row)
+    }
+
+    /// Newest segment wins; a tombstone in a newer segment hides older rows.
+    fn lookup_row(&self, table_id: u32, pk: i64) -> DbResult<Option<Row>> {
+        for segment in self.segments.iter().rev() {
+            match segment.lookup(table_id, pk) {
+                Some(Lookup::Row(slot)) => {
+                    return Ok(Some((*self.cached_segment_row(segment, table_id, slot)?).clone()))
+                }
+                Some(Lookup::Deleted) => return Ok(None),
+                None => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Streaming merge of the transaction overlay, the committed overlay and all
+    /// live segments, in ascending primary-key order.
+    fn scan_table(&self, table_id: u32, f: &mut dyn FnMut(i64, &Row) -> bool) -> DbResult<()> {
+        let overlay: Vec<(i64, &Option<Row>)> = match &self.txn {
+            Some(txn) => {
+                let mut items: Vec<(i64, &Option<Row>)> = txn
+                    .writes
+                    .iter()
+                    .filter(|((table, _), _)| *table == table_id)
+                    .map(|((_, pk), value)| (*pk, value))
+                    .collect();
+                items.sort_by_key(|(pk, _)| *pk);
+                items
+            }
+            None => Vec::new(),
+        };
+        let committed = self.committed.get(&table_id);
+        let mut cursors: Vec<SegmentCursor> = Vec::new();
+        for segment in self.segments.iter().rev() {
+            if segment.has_table(table_id) {
+                cursors.push(SegmentCursor::new(segment, table_id)?);
+            }
+        }
+        if committed.is_none() && overlay.is_empty() && cursors.is_empty() {
+            return Ok(());
+        }
+        let mut committed_iter = committed.map(|map| map.iter());
+        let mut committed_next: Option<(i64, &Option<Row>)> = None;
+        let mut overlay_index = 0usize;
+        loop {
+            if committed_next.is_none() {
+                committed_next = committed_iter
+                    .as_mut()
+                    .and_then(|iter| iter.next().map(|(pk, value)| (*pk, value)));
+            }
+            let overlay_pk = overlay.get(overlay_index).map(|(pk, _)| *pk);
+            let committed_pk = committed_next.map(|(pk, _)| pk);
+            let mut min_pk = overlay_pk;
+            if let Some(pk) = committed_pk {
+                min_pk = Some(match min_pk {
+                    Some(current) => current.min(pk),
+                    None => pk,
+                });
+            }
+            for cursor in &cursors {
+                if let Some(pk) = cursor.peek() {
+                    min_pk = Some(match min_pk {
+                        Some(current) => current.min(pk),
+                        None => pk,
+                    });
+                }
+            }
+            let Some(pk) = min_pk else {
+                break;
+            };
+            let mut decided = false;
+            let mut borrowed: Option<&Row> = None;
+            let mut chosen_cursor: Option<usize> = None;
+            let mut chosen_slot: Option<Option<Slot>> = None;
+            if overlay_pk == Some(pk) {
+                decided = true;
+                borrowed = overlay[overlay_index].1.as_ref();
+                overlay_index += 1;
+            }
+            if committed_pk == Some(pk) {
+                if !decided {
+                    decided = true;
+                    borrowed = committed_next.and_then(|(_, value)| value.as_ref());
+                }
+                committed_next = None;
+            }
+            for index in 0..cursors.len() {
+                if cursors[index].peek() == Some(pk) {
+                    let entry = cursors[index].advance();
+                    if !decided {
+                        decided = true;
+                        chosen_cursor = Some(index);
+                        chosen_slot = Some(entry);
+                    }
+                }
+            }
+            let mut shared: Option<Arc<Row>> = None;
+            if let (Some(index), Some(Some(slot))) = (chosen_cursor, chosen_slot) {
+                shared = Some(self.cached_cursor_row(&mut cursors[index], table_id, slot)?);
+            }
+            if let Some(row) = borrowed {
+                if !f(pk, row) {
+                    break;
+                }
+            } else if let Some(row) = shared {
+                if !f(pk, row.as_ref()) {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+    #[cfg(test)]
+    fn wal_len(&self) -> u64 {
+        self.wal.len
+    }
+    #[cfg(test)]
+    fn committed_row_count(&self) -> usize {
+        self.committed_rows
+    }
+    #[cfg(test)]
+    fn cached_row_count(&self) -> usize {
+        self.cache.borrow().len()
+    }
+    #[cfg(test)]
+    fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -992,7 +1534,7 @@ impl Storage for DiskStorage {
         }
         self.write_txn_record(&txn)?;
         self.apply_txn(txn);
-        self.maybe_checkpoint();
+        self.maybe_flush();
         Ok(())
     }
 
@@ -1040,10 +1582,7 @@ impl Storage for DiskStorage {
                 return Ok(value.clone());
             }
         }
-        match self.base_lookup(table_id, pk) {
-            Some(slot) => Ok(Some((*self.cached_row(table_id, slot)?).clone())),
-            None => Ok(None),
-        }
+        self.lookup_row(table_id, pk)
     }
 
     fn put(&mut self, table_id: u32, pk: i64, row: Row) -> DbResult<()> {
@@ -1071,109 +1610,13 @@ impl Storage for DiskStorage {
     }
 
     fn scan(&self, table_id: u32, f: &mut dyn FnMut(i64, &Row) -> bool) -> DbResult<()> {
-        let overlay: Vec<(i64, &Option<Row>)> = match &self.txn {
-            Some(txn) => {
-                let mut items: Vec<(i64, &Option<Row>)> = txn
-                    .writes
-                    .iter()
-                    .filter(|((table, _), _)| *table == table_id)
-                    .map(|((_, pk), value)| (*pk, value))
-                    .collect();
-                items.sort_by_key(|(pk, _)| *pk);
-                items
-            }
-            None => Vec::new(),
-        };
-        let base_slots: &[Slot] = match self.base.get(&table_id) {
-            Some(slots) => slots.as_slice(),
-            None => &[],
-        };
-        let committed = self.committed.get(&table_id);
-        if base_slots.is_empty() && committed.is_none() && overlay.is_empty() {
-            return Ok(());
-        }
-        let mut base_reader = if base_slots.is_empty() {
-            None
-        } else {
-            Some(RecordReader::open(&self.data_path)?)
-        };
-        let mut committed_iter: Option<btree_map::Iter<i64, Option<Row>>> = committed.map(|map| map.iter());
-        let mut committed_next: Option<(i64, &Option<Row>)> = None;
-        let mut base_index = 0usize;
-        let mut overlay_index = 0usize;
-        loop {
-            if committed_next.is_none() {
-                committed_next = committed_iter
-                    .as_mut()
-                    .and_then(|iter| iter.next().map(|(pk, value)| (*pk, value)));
-            }
-            let base_pk = base_slots.get(base_index).map(|slot| slot.pk);
-            let committed_pk = committed_next.map(|(pk, _)| pk);
-            let overlay_pk = overlay.get(overlay_index).map(|(pk, _)| *pk);
-            let pk = match [base_pk, committed_pk, overlay_pk].into_iter().flatten().min() {
-                Some(pk) => pk,
-                None => break,
-            };
-            let mut decided = false;
-            let mut borrowed: Option<&Row> = None;
-            let mut shared: Option<Arc<Row>> = None;
-            if overlay_pk == Some(pk) {
-                decided = true;
-                borrowed = overlay[overlay_index].1.as_ref();
-                overlay_index += 1;
-            }
-            if committed_pk == Some(pk) {
-                if !decided {
-                    decided = true;
-                    borrowed = committed_next.and_then(|(_, value)| value.as_ref());
-                }
-                committed_next = None;
-            }
-            if base_pk == Some(pk) {
-                let slot = base_slots[base_index];
-                base_index += 1;
-                if !decided {
-                    let cached = self.cache.borrow().get((table_id, slot.pk));
-                    if let Some(cached) = cached {
-                        shared = Some(cached);
-                    } else {
-                        let reader = base_reader
-                            .as_mut()
-                            .ok_or_else(|| format::corrupt("missing checkpoint reader"))?;
-                        let row = Arc::new(reader.read_row(slot)?);
-                        let size = format::encoded_row_len(&row) + 48;
-                        self.cache
-                            .borrow_mut()
-                            .insert((table_id, slot.pk), Arc::clone(&row), size);
-                        shared = Some(row);
-                    }
-                }
-            }
-            if let Some(row) = borrowed {
-                if !f(pk, row) {
-                    break;
-                }
-            } else if let Some(row) = shared {
-                if !f(pk, row.as_ref()) {
-                    break;
-                }
-            }
-        }
-        Ok(())
+        self.scan_table(table_id, f)
     }
 
-    fn row_count_hint(&self, table_id: u32) -> Option<usize> {
-        let base = self.base.get(&table_id).map(|slots| slots.len()).unwrap_or(0);
-        let overlay = self.committed.get(&table_id).map(|rows| rows.len()).unwrap_or(0);
-        Some(base + overlay)
-    }
-
-    /// Shutdown flush. Every acknowledged commit is already fsynced to the WAL,
-    /// so there is nothing to force here. A full checkpoint on shutdown rewrites
-    /// the whole data set and can blow the judge's per-request timeout on large
-    /// databases, and it is not required for durability; the next open replays
-    /// the WAL (bounded by the checkpoint thresholds) instead.
     fn flush(&mut self) -> DbResult<()> {
+        if self.txn.is_none() {
+            self.flush_and_compact()?;
+        }
         Ok(())
     }
 }
@@ -1183,6 +1626,7 @@ mod tests {
     use super::*;
     use crate::types::{ColType, Value};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1200,7 +1644,7 @@ mod tests {
             let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             path.push("target");
             path.push("disk-storage-tests");
-            path.push(format!("mvd-disk-{}-{}-{}-{}", tag, std::process::id(), nanos, unique));
+            path.push(format!("mvd-seg-{}-{}-{}-{}", tag, std::process::id(), nanos, unique));
             fs::create_dir_all(&path).unwrap();
             TempDir { path }
         }
@@ -1242,12 +1686,23 @@ mod tests {
         out
     }
 
+    /// Force a flush on every commit and a small merge budget, so tests exercise
+    /// many segments and bounded merges quickly.
+    fn enable_eager_flushing(storage: &mut DiskStorage, wal_bytes: u64, merge_bytes: u64, target: usize) {
+        storage.wal_bytes = wal_bytes;
+        storage.flush_rows = 1_000_000_000;
+        storage.merge_bytes = merge_bytes;
+        storage.target_segments = target;
+    }
+
     #[test]
     fn fresh_directory_opens_empty() {
         let dir = TempDir::new("fresh");
         let storage = DiskStorage::open(&dir.path).unwrap();
         assert!(storage.list_tables().is_empty());
         assert_eq!(storage.generation(), 1);
+        assert_eq!(storage.segment_count(), 0);
+        assert!(dir.path.join(MANIFEST_FILE).exists());
         assert_eq!(storage.get(1, 1).unwrap(), None);
         assert_eq!(pks(&storage, 1), Vec::<i64>::new());
     }
@@ -1275,6 +1730,7 @@ mod tests {
         assert_eq!(storage.get(table_id, 1).unwrap().unwrap()[1], Value::Str("row-1".to_string()));
         assert_eq!(storage.vector_indexes(table_id), vec![2]);
         assert_eq!(storage.list_tables().len(), 1);
+        assert_eq!(storage.segment_count(), 1);
     }
 
     #[test]
@@ -1295,6 +1751,7 @@ mod tests {
         let storage = DiskStorage::open(&dir.path).unwrap();
         assert_eq!(pks(&storage, table_id), (0..100).collect::<Vec<_>>());
         assert_eq!(storage.committed_row_count(), 100);
+        assert_eq!(storage.segment_count(), 0);
     }
 
     #[test]
@@ -1356,7 +1813,7 @@ mod tests {
             let (columns, pk) = table_spec();
             table_id = storage.create_table("t", columns, pk).unwrap().id;
             storage.put(table_id, 1, make_row(1)).unwrap();
-            storage.checkpoint().unwrap();
+            storage.flush().unwrap();
             generation = storage.generation();
         }
         let wal = wal_path(&dir.path, generation);
@@ -1380,60 +1837,190 @@ mod tests {
     }
 
     #[test]
-    fn multiple_checkpoints_recover_with_updates_and_deletes() {
-        let dir = TempDir::new("ckpt");
+    fn multiple_segments_merge_and_recover() {
+        let dir = TempDir::new("multiseg");
         let table_id;
         {
             let mut storage = DiskStorage::open(&dir.path).unwrap();
             let (columns, pk) = table_spec();
             table_id = storage.create_table("t", columns, pk).unwrap().id;
-            for batch in 0..4i64 {
+            enable_eager_flushing(&mut storage, 2048, 64 * 1024, 4);
+            for batch in 0..20i64 {
                 storage.begin().unwrap();
-                for offset in 0..50i64 {
-                    let pk = batch * 50 + offset;
+                for offset in 0..20i64 {
+                    let pk = batch * 20 + offset;
                     storage.put(table_id, pk, make_row(pk)).unwrap();
                 }
                 storage.commit().unwrap();
-                storage.checkpoint().unwrap();
             }
-            storage.put(table_id, 0, make_row(1000)).unwrap();
-            storage.delete(table_id, 199).unwrap();
-            storage.checkpoint().unwrap();
-            assert!(storage.generation() >= 5);
+            // Update some rows that now live in older segments, delete others.
+            storage.put(table_id, 5, make_row(5000)).unwrap();
+            storage.delete(table_id, 6).unwrap();
+            storage.flush().unwrap();
+            assert!(storage.generation() > 10);
+            assert!(
+                storage.segment_count() <= 6,
+                "segment count must stay bounded, got {}",
+                storage.segment_count()
+            );
+            let keys = pks(&storage, table_id);
+            assert_eq!(keys.len(), 399);
+            assert_eq!(storage.get(table_id, 5).unwrap().unwrap()[0], Value::Int(5000));
+            assert_eq!(storage.get(table_id, 6).unwrap(), None);
         }
         let storage = DiskStorage::open(&dir.path).unwrap();
         let keys = pks(&storage, table_id);
-        assert_eq!(keys.len(), 199);
-        assert_eq!(keys[0], 0);
-        assert_eq!(storage.get(table_id, 0).unwrap().unwrap()[0], Value::Int(1000));
-        assert_eq!(storage.get(table_id, 199).unwrap(), None);
-        assert_eq!(storage.get(table_id, 150).unwrap().unwrap()[0], Value::Int(150));
+        assert_eq!(keys.len(), 399);
+        assert_eq!(storage.get(table_id, 5).unwrap().unwrap()[0], Value::Int(5000));
+        assert_eq!(storage.get(table_id, 6).unwrap(), None);
+        assert_eq!(storage.get(table_id, 399).unwrap().unwrap()[0], Value::Int(399));
     }
 
     #[test]
-    fn checkpoint_bounds_wal_growth() {
-        let dir = TempDir::new("bound");
+    fn deletes_and_updates_shadow_older_segments() {
+        let dir = TempDir::new("shadow");
+        let table_id;
+        {
+            let mut storage = DiskStorage::open(&dir.path).unwrap();
+            let (columns, pk) = table_spec();
+            table_id = storage.create_table("t", columns, pk).unwrap().id;
+            enable_eager_flushing(&mut storage, 512, 256 * 1024, 8);
+            for pk in 0..10i64 {
+                storage.put(table_id, pk, make_row(pk)).unwrap();
+            }
+            storage.flush().unwrap();
+            // Newer segment: overwrite half, delete the other half.
+            for pk in 0..10i64 {
+                if pk % 2 == 0 {
+                    storage.put(table_id, pk, make_row(1000 + pk)).unwrap();
+                } else {
+                    storage.delete(table_id, pk).unwrap();
+                }
+            }
+            storage.flush().unwrap();
+            assert_eq!(pks(&storage, table_id), vec![0, 2, 4, 6, 8]);
+        }
+        let storage = DiskStorage::open(&dir.path).unwrap();
+        assert_eq!(pks(&storage, table_id), vec![0, 2, 4, 6, 8]);
+        assert_eq!(storage.get(table_id, 0).unwrap().unwrap()[0], Value::Int(1000));
+        assert_eq!(storage.get(table_id, 1).unwrap(), None);
+        assert_eq!(storage.get(table_id, 8).unwrap().unwrap()[0], Value::Int(1008));
+    }
+
+    #[test]
+    fn middle_run_merge_preserves_tombstones_over_older_segment() {
+        let dir = TempDir::new("midmerge");
+        let table_id;
+        {
+            let mut storage = DiskStorage::open(&dir.path).unwrap();
+            let (columns, pk) = table_spec();
+            table_id = storage.create_table("t", columns, pk).unwrap().id;
+            // Flush every commit, merge only runs that fit 4 KiB. The first
+            // segment is much larger than the budget, so merges start after it.
+            storage.wal_bytes = 1;
+            storage.flush_rows = 1_000_000_000;
+            storage.merge_bytes = 4096;
+            storage.target_segments = 2;
+            storage.begin().unwrap();
+            for pk in 0..400i64 {
+                storage.put(table_id, pk, make_row(pk)).unwrap();
+            }
+            storage.commit().unwrap();
+            storage.flush().unwrap();
+            assert_eq!(storage.segment_count(), 1);
+            // Delete rows that only exist in that first segment; each delete
+            // lands in its own tiny segment, which then gets merged.
+            for pk in 0..20i64 {
+                storage.delete(table_id, pk).unwrap();
+            }
+            storage.flush().unwrap();
+            assert!(storage.segment_count() >= 2);
+            for pk in 0..20i64 {
+                assert_eq!(storage.get(table_id, pk).unwrap(), None, "row {} resurrected", pk);
+            }
+            let keys = pks(&storage, table_id);
+            assert_eq!(keys.len(), 380);
+            assert_eq!(keys[0], 20);
+        }
+        let storage = DiskStorage::open(&dir.path).unwrap();
+        for pk in 0..20i64 {
+            assert_eq!(storage.get(table_id, pk).unwrap(), None, "row {} resurrected after reopen", pk);
+        }
+        assert_eq!(pks(&storage, table_id).len(), 380);
+    }
+
+    #[test]
+    fn segment_count_stays_bounded_under_repeated_flushes() {
+        let dir = TempDir::new("bounded");
         let mut storage = DiskStorage::open(&dir.path).unwrap();
-        storage.checkpoint_bytes = 4096;
-        storage.checkpoint_rows = 100;
         let (columns, pk) = table_spec();
         let table_id = storage.create_table("t", columns, pk).unwrap().id;
-        for pk in 0..500i64 {
+        enable_eager_flushing(&mut storage, 4096, 128 * 1024, 4);
+        let mut worst = Duration::from_millis(0);
+        for pk in 0..600i64 {
             storage.begin().unwrap();
             storage.put(table_id, pk, make_row(pk)).unwrap();
+            let started = Instant::now();
             storage.commit().unwrap();
+            let elapsed = started.elapsed();
+            if elapsed > worst {
+                worst = elapsed;
+            }
+            assert!(
+                storage.segment_count() <= 6,
+                "segment count grew to {}",
+                storage.segment_count()
+            );
         }
-        assert!(storage.generation() > 2, "checkpoint should have been triggered");
-        assert!(storage.wal_len() <= 8192, "WAL must stay bounded, got {}", storage.wal_len());
-        assert_eq!(pks(&storage, table_id), (0..500).collect::<Vec<_>>());
-        drop(storage);
-        let storage = DiskStorage::open(&dir.path).unwrap();
-        assert_eq!(pks(&storage, table_id), (0..500).collect::<Vec<_>>());
+        assert_eq!(pks(&storage, table_id), (0..600).collect::<Vec<_>>());
+        assert!(
+            worst < Duration::from_secs(5),
+            "single commit took {:?}, suspiciously slow for a bounded flush",
+            worst
+        );
     }
 
     #[test]
-    fn stale_files_from_interrupted_checkpoint_are_ignored() {
-        let dir = TempDir::new("stale");
+    fn row_cache_does_not_alias_tables_with_the_same_primary_key() {
+        let dir = TempDir::new("alias");
+        let (left, right);
+        {
+            let mut storage = DiskStorage::open(&dir.path).unwrap();
+            let (columns, pk) = table_spec();
+            left = storage.create_table("a", columns, pk).unwrap().id;
+            let columns = vec![
+                ColumnDef { name: "id".to_string(), ty: ColType::BigInt, is_pk: true },
+                ColumnDef { name: "value".to_string(), ty: ColType::Varchar(32), is_pk: false },
+            ];
+            right = storage.create_table("b", columns, 0).unwrap().id;
+            storage
+                .put(left, 1, vec![Value::Int(1), Value::Str("left".to_string()), Value::Null])
+                .unwrap();
+            storage
+                .put(right, 1, vec![Value::Int(1), Value::Str("right".to_string())])
+                .unwrap();
+            storage.flush().unwrap();
+            // Warm the cache through one table, then read the other.
+            assert_eq!(storage.get(left, 1).unwrap().unwrap()[1], Value::Str("left".to_string()));
+            assert_eq!(storage.get(right, 1).unwrap().unwrap()[1], Value::Str("right".to_string()));
+        }
+        let storage = DiskStorage::open(&dir.path).unwrap();
+        assert_eq!(storage.get(left, 1).unwrap().unwrap()[1], Value::Str("left".to_string()));
+        assert_eq!(storage.get(right, 1).unwrap().unwrap()[1], Value::Str("right".to_string()));
+        let mut right_rows = Vec::new();
+        storage
+            .scan(right, &mut |_, row| {
+                right_rows.push(row.clone());
+                true
+            })
+            .unwrap();
+        assert_eq!(right_rows.len(), 1);
+        assert_eq!(right_rows[0][1], Value::Str("right".to_string()));
+    }
+
+    #[test]
+    fn orphaned_segment_and_temp_files_are_ignored() {
+        let dir = TempDir::new("orphans");
         let table_id;
         {
             let mut storage = DiskStorage::open(&dir.path).unwrap();
@@ -1442,16 +2029,19 @@ mod tests {
             storage.put(table_id, 1, make_row(1)).unwrap();
             storage.flush().unwrap();
         }
-        for name in ["ckpt-99.dat", "ckpt-99.idx", "ckpt-99.cat", "wal-99.log", "ckpt-3.dat.tmp", "CURRENT.tmp"] {
-            fs::write(dir.path.join(name), b"garbage").unwrap();
-        }
+        // A crash after writing the merged segment but before the manifest switch
+        // leaves an unreferenced segment plus a temp manifest behind.
+        fs::write(dir.path.join("seg-999.dat"), b"garbage").unwrap();
+        fs::write(dir.path.join("seg-999.idx"), b"garbage").unwrap();
+        fs::write(dir.path.join("MANIFEST.tmp"), b"garbage").unwrap();
+        fs::write(dir.path.join("wal-999.log"), b"garbage").unwrap();
         for _ in 0..2 {
             let storage = DiskStorage::open(&dir.path).unwrap();
             assert_eq!(pks(&storage, table_id), vec![1]);
         }
         for entry in fs::read_dir(&dir.path).unwrap() {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-            assert!(!name.contains("99"), "stale file survived: {}", name);
+            assert!(!name.contains("999"), "orphan survived: {}", name);
             assert!(!name.ends_with(".tmp"), "temp file survived: {}", name);
         }
     }
@@ -1524,7 +2114,7 @@ mod tests {
                 storage.put(table_id, pk, make_row(pk)).unwrap();
             }
             storage.commit().unwrap();
-            storage.checkpoint().unwrap();
+            storage.flush().unwrap();
             assert_eq!(storage.cached_row_count(), 0);
             assert_eq!(pks(&storage, table_id).len(), 200);
             assert_eq!(storage.cached_row_count(), 200);
@@ -1556,8 +2146,8 @@ mod tests {
             }
             storage.commit().unwrap();
             assert_eq!(pks(&storage, table_id), (0..count).collect::<Vec<_>>());
-            storage.checkpoint().unwrap();
-            assert_eq!(storage.committed_row_count(), 0, "checkpoint must empty the memory overlay");
+            storage.flush().unwrap();
+            assert_eq!(storage.committed_row_count(), 0, "flush must empty the memory overlay");
             assert_eq!(storage.get(table_id, count / 2).unwrap().unwrap()[0], Value::Int(count / 2));
         }
         let storage = DiskStorage::open(&dir.path).unwrap();
@@ -1578,7 +2168,3 @@ mod tests {
         assert_eq!(seen, count);
     }
 }
-
-
-
-
