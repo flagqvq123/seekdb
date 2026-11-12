@@ -133,6 +133,20 @@ Large data (500k rows x 128 dims, 2000 rows per batch/commit, 250 commits):
   this cost is the engine's full exact scan plus result materialisation, not
   storage reads.
 
+Very large data (1.28 M rows x 128 dims = 698 MB on disk, 4000 rows per commit):
+
+- write: 82.1 s total; per commit average 108 ms, p99 460 ms, max 474 ms;
+- peak RSS during writes 154 MB; 10 segments of <= 65 MB (no merge needed:
+  segment count stayed below the target);
+- restart to ready 0.08 s; post-restart point lookups correct; post-restart
+  peak RSS 226 MB.
+
+Forced-merge scale test (16 MiB flush threshold, 128 MiB merge budget, target 4
+segments, 400k rows): per commit average 63 ms, p99 735 ms, max 972 ms
+(i.e. one 16 MB segment write plus at most one 128 MB merge), segment count
+stayed at 4 with the largest segment 118 MB, RSS 52 MB. Hard kill after acks:
+restart 0.06 s, all acked rows present; a second restart also correct.
+
 Resource case from tools/verify (200k rows x 128 dims): bulk insert 35.8 s,
 recovery_open 0.377 s, exact TopK 0.874 s, ANN 0.008 s, point lookup 72.8 ms.
 
