@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 
 #include "config_bridge.h"
+#include "sql/engine/basic/ob_file_scan_utils.h"
 #include "share/config/ob_config_helper.h"
 #include "sql/resolver/cmd/ob_load_data_stmt.h"
 
@@ -121,6 +122,17 @@ int ObResolverUtils::get_all_function_table_column_names(const TableItem &table_
                                                          ObIArray<ObString> &column_names)
 {
   int ret = OB_SUCCESS;
+  if (!table_item.file_sql_config_.empty()) {
+    FileSqlConfig config;
+    if(OB_FAIL(config.decode(table_item.file_sql_config_))) {return ret;}
+    for(const auto &column:config.columns_) {
+      ObString name;
+      ObString original(column.name_.size(),column.name_.data());
+      if(OB_FAIL(ob_write_string(*params.allocator_,original,name))) {return ret;}
+      if(OB_FAIL(column_names.push_back(name))) {return ret;}
+    }
+    return ret;
+  }
   ObRawExpr *table_expr = NULL;
   ObPLPackageGuard *package_guard = nullptr;
   const ObUserDefinedType *user_type = NULL;
@@ -1673,6 +1685,12 @@ stmt::StmtType ObResolverUtils::get_stmt_type_by_item_type(const ObItemType item
 {
   stmt::StmtType type;
   switch (item_type) {
+    case T_DESCRIBE_SELECT:
+    case T_COPY_FILE:
+    case T_SHOW_AI_COLUMNS: {
+      type = stmt::T_SELECT;
+      break;
+    }
 #define SET_STMT_TYPE(item_type) \
   case item_type: {              \
     type = stmt::item_type;      \

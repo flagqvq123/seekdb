@@ -1,0 +1,19 @@
+connection default;
+select json_extract(ai_prompt('{0}', json_array(1,true)), '$.args[0]') = json_array(1,true) as array_preserved;
+select json_extract(ai_prompt('{0}', json_object('a',json_array(1,2))), '$.args[0]') = json_object('a',json_array(1,2)) as object_preserved;
+select json_extract(ai_prompt('outer {0}', ai_prompt('inner {0}', 'x')), '$.args[0].template') = 'inner {0}' as nested_preserved;
+select json_unquote(json_extract(ai_prompt(X'7B307D', X'41'), '$.args[0]')) = 'A' as hex_argument;
+--disable_warnings
+drop table if exists ai_prompt_regression;
+--enable_warnings
+create table ai_prompt_regression(t longtext, a text, b blob);
+insert into ai_prompt_regression values(concat(repeat('长',100000),'{0}'),repeat('中',20000),'blob {0}');
+select json_unquote(json_extract(ai_prompt(t,a), '$.template')) = t as template_complete,
+       json_unquote(json_extract(ai_prompt(t,a), '$.args[0]')) = a as argument_complete,
+       json_unquote(json_extract(ai_prompt(b,'x'), '$.template')) = b as blob_complete
+from ai_prompt_regression;
+drop table ai_prompt_regression;
+--error 1210
+select ai_complete('unused_model',ai_prompt('{999999999999999999999999999999999999}', 'x'));
+--error 1210
+select ai_complete('unused_model',ai_prompt('{1}', 'x'));

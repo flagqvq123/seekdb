@@ -87,7 +87,7 @@ export OBD_DEPS_PATH="$OB_BASE_DIR/deps/init/oceanbase.$RELEASE.$ARCHITECTURES.d
 export OBD_BIN=${_OBD_BIN:-$DEP_PATH/usr/bin/obd}
 export OBDO_CMD_BIN=${_OBDO_CMD_BIN:-$DEP_PATH/usr/bin/ob_do_cmd}
 alias obd="${OBD_BIN}"
-export OBD_HOME=${_OBD_HOME:-$DIR/tools/deploy}
+export OBD_HOME=${_OBD_HOME:-$DEPLOY_PATH}
 export OBD_INSTALL_PRE=${_OBD_INSTALL_PRE:-$DEP_PATH} 
 export OBD_PORT_GEN=$((100*($(id -u)%500)+10000))
 

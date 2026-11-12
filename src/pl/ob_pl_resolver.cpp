@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX PL
+#include "sql/engine/expr/ob_expr_ai/ai_column_service.h"
 
 #include "config_bridge.h"
 #include "ob_pl_resolver.h"
@@ -1223,17 +1224,24 @@ int ObPLResolver::build_record_type_by_table_schema(ObSchemaGetterGuard &schema_
                                                     const ObTableSchema* table_schema,
                                                     ObRecordType *&record_type,
                                                     pl::ObPLEnumSetCtx *enum_set_ctx,
-                                                    bool with_rowid)
+                                                    bool with_rowid,
+                                                    bool include_ai_hidden)
 {
   int ret = OB_SUCCESS;
   CK (OB_NOT_NULL(table_schema));
   OZ (record_type->record_members_init(&allocator, table_schema->get_column_count() + 1));
+  bool has_ai_columns = false;
+  for (auto it = table_schema->column_begin(); !has_ai_columns && it != table_schema->column_end(); ++it) {
+    has_ai_columns = (*it)->is_ai_column();
+  }
   if (OB_SUCC(ret)) {
     ObTableSchema::const_column_iterator cs_iter = table_schema->column_begin();
     ObTableSchema::const_column_iterator cs_iter_end = table_schema->column_end();
     for (; OB_SUCC(ret) && cs_iter != cs_iter_end; cs_iter++) {
       const ObColumnSchemaV2 &column_schema = **cs_iter;
-      if (!column_schema.is_hidden()) {
+      if (!column_schema.is_hidden() || (include_ai_hidden
+          && (column_schema.get_column_name_str().prefix_match("__ai_")
+              || (has_ai_columns && column_schema.get_rowkey_position() > 0)))) {
         ObPLDataType pl_type;
         ObDataType data_type;
         data_type.set_meta_type(column_schema.get_meta_type());
@@ -1332,7 +1340,8 @@ int ObPLResolver::build_record_type_by_schema(
         resolve_ctx, table_schema, record_type));
     } else {
       OZ (build_record_type_by_table_schema(
-        resolve_ctx.schema_guard_, resolve_ctx.allocator_, table_schema, record_type, resolve_ctx.enum_set_ctx_, with_rowid));
+        resolve_ctx.schema_guard_, resolve_ctx.allocator_, table_schema, record_type, resolve_ctx.enum_set_ctx_, with_rowid,
+        resolve_ctx.session_info_.is_for_trigger_package()));
     }
   }
   return ret;
@@ -2262,6 +2271,34 @@ int ObPLResolver::resolve_assign(const ObStmtNodeTree *parse_tree, ObPLAssignStm
           }
         }
         if (OB_SUCC(ret) && OB_ISNULL(into_expr)) {
+          if (resolve_ctx_.session_info_.is_for_trigger_package() && q_name.access_idents_.count() >= 2
+              && q_name.access_idents_.at(0).access_name_.case_compare("NEW") == 0) {
+            bool managed = sql::AIColumnService::is_worker_write()
+                && !resolve_ctx_.session_info_.is_user_session();
+            if (!managed && ObTriggerInfo::is_trigger_package_id(func.get_package_id())) {
+              const ObTriggerInfo *trigger = nullptr;
+              if (OB_FAIL(resolve_ctx_.schema_guard_.get_trigger_info(ObTriggerInfo::get_package_trigger_id(func.get_package_id()), trigger))) {
+              } else if (trigger != nullptr) {
+                const ObString &name = trigger->get_trigger_name();
+                managed = name.length() >= 5 && ObString(5, name.ptr()).case_compare("__ai_") == 0;
+              }
+            }
+            for (int64_t var_index = 0; OB_SUCC(ret) && !managed && var_index < func.get_symbol_table().get_count(); ++var_index) {
+              const ObPLVar *variable = func.get_symbol_table().get_symbol(var_index);
+              if (variable != nullptr && variable->get_name().case_compare("NEW") == 0 && variable->get_type().is_record_type()) {
+                const ObTableSchema *table = nullptr;
+                if (OB_FAIL(resolve_ctx_.schema_guard_.get_table_schema(variable->get_type().get_user_type_id(), table))) {
+                } else if (table != nullptr) {
+                  const ObColumnSchemaV2 *column = table->get_column_schema(q_name.access_idents_.at(1).access_name_);
+                  if (column != nullptr && (column->is_ai_column()
+                      || (column->is_hidden() && column->get_column_name_str().prefix_match("__ai_")))) {
+                    ret = OB_NOT_SUPPORTED;
+                    LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an AI result or state from a user trigger");
+                  }
+                }
+              }
+            }
+          }
           OZ (resolve_var(q_name, func, into_expr, true/*for write*/));
           CK (OB_NOT_NULL(into_expr));
         }

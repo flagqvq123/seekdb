@@ -456,6 +456,7 @@ static const NonReservedKeyword Mysql_none_reserved_keywords[] =
   {"master_password", MASTER_PASSWORD},
   {"master_port", MASTER_PORT},
   {"master_retry_count", MASTER_RETRY_COUNT},
+  {"retry", RETRY},
   {"master_server_id", MASTER_SERVER_ID},
   {"master_ssl", MASTER_SSL},
   {"master_ssl_ca", MASTER_SSL_CA},

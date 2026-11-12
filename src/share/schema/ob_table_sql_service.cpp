@@ -3206,6 +3206,7 @@ int ObTableSqlService::gen_column_dml_without_check(
                          || OB_FAIL(dml.add_column("order_in_rowkey", column.get_order_in_rowkey()))
                          || OB_FAIL(dml.add_column("collation_type", column.get_collation_type()))
                          || OB_FAIL(dml.add_column("comment", ObHexEscapeSqlStr(column.get_comment())))
+                         || OB_FAIL(dml.add_column("ai_column_config", ObHexEscapeSqlStr(column.get_ai_column_config())))
                          || OB_FAIL(is_history
                                         ? dml.add_pk_column("schema_version", column.get_schema_version())
                                         : dml.add_column("schema_version", column.get_schema_version()))

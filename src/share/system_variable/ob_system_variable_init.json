@@ -10961,6 +10961,19 @@
     "background_cn": "",
     "ref_url": ""
   },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Allow read-only local file table functions after secure_file_priv validation",
+    "flags": "SESSION | GLOBAL | INFLUENCE_PLAN | NEED_SERIALIZE | MYSQL_ONLY",
+    "publish_version": "1.4.0.0",
+    "info_cn": "启用本地文件 SQL 表函数",
+    "background_cn": "",
+    "ref_url": ""
+  },
   "ob_sparse_drop_ratio_search": {
     "id": 10753,
     "name": "ob_sparse_drop_ratio_search",
@@ -10973,6 +10986,19 @@
     "max_val": "100",
     "publish_version": "1.0.0.0",
     "info_cn": "",
+    "background_cn": "",
+    "ref_url": ""
+  },
+  "ai_column_strict_read": {
+    "id": 10755,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "Reject statements referencing an AI column with non-ready rows",
+    "flags": "SESSION | INFLUENCE_PLAN | NEED_SERIALIZE | MYSQL_ONLY",
+    "publish_version": "1.4.0.0",
+    "info_cn": "读取未完成的 AI 列时报错",
     "background_cn": "",
     "ref_url": ""
   }

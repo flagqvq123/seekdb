@@ -292,6 +292,10 @@ bool ObSqlParameterization::is_tree_not_param(const ParseNode *tree)
     ret_bool = true;
   } else if (true == tree->is_tree_not_param_) {
     ret_bool = true;
+  } else if (T_FILE_TABLE_EXPRESSION == tree->type_ || T_COPY_FILE == tree->type_
+             || T_DESCRIBE_SELECT == tree->type_) {
+    // File paths/options determine the result schema and must retain their literals.
+    ret_bool = true;
   } else if (T_GROUPBY_CLAUSE == tree->type_) {
     // select a from t group by 1 enables group by parameterization
     ret_bool = true;

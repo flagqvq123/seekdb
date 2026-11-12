@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/resolver/ddl/ai_column_resolver.h"
 #include "config_bridge.h"
 #include "ob_ddl_resolver.h"
 #include "data_plane/blocksstable/ob_index_block_util.h"
@@ -1908,6 +1909,9 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
         column.add_column_flag(PAD_WHEN_CALC_GENERATED_COLUMN_FLAG);
       }
     }
+  }
+  if (OB_SUCC(ret) && node->num_child_ == 6 && node->children_[4] != nullptr) {
+    ret = AIColumnResolver::resolve_definition(*allocator_, column, *node->children_[4], node->children_[5]);
   }
   if (OB_SUCC(ret)) {
     ParseNode *attrs_node = node->children_[2];

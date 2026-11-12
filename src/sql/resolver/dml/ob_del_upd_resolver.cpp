@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/engine/expr/ob_expr_ai/ai_column_service.h"
 #include "ob_del_upd_resolver.h"
 #include "sql/resolver/dml/ob_default_value_utils.h"
 #include "sql/resolver/dml/ob_update_stmt.h"
@@ -407,6 +408,25 @@ int ObDelUpdResolver::resolve_assign_columns(const ParseNode &assign_target,
       } else if (OB_ISNULL(base_col_expr)) {
         ret = OB_ERR_UNEXPECTED;
       }
+      if (OB_SUCC(ret)) {
+        const ObColumnRefRawExpr *original = static_cast<ObColumnRefRawExpr *>(col_expr);
+        const ColumnItem *item = get_stmt()->get_column_item_by_id(original->get_table_id(), original->get_column_id());
+        const TableItem *table = get_stmt()->get_table_item_by_id(original->get_table_id());
+        const uint64_t table_id = item != nullptr && item->base_tid_ != OB_INVALID_ID
+            ? item->base_tid_ : table != nullptr && table->is_basic_table() ? table->ref_id_ : OB_INVALID_ID;
+        const uint64_t column_id = item != nullptr && item->base_cid_ != OB_INVALID_ID
+            ? item->base_cid_ : base_col_expr->get_column_id();
+        const ObColumnSchemaV2 *schema = nullptr;
+        if (table_id != OB_INVALID_ID) {
+          if (OB_FAIL(schema_checker_->get_column_schema(table_id, column_id, schema, true))) {
+          } else if (schema != nullptr && (schema->is_ai_column()
+                     || (schema->is_hidden() && schema->get_column_name_str().prefix_match("__ai_")))
+                     && !(AIColumnService::is_worker_write() && !session_info_->is_user_session())) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an AI result column");
+          }
+        }
+      }
       if (OB_SUCC(ret) &&
           OB_FAIL(column_list.push_back(static_cast<ObColumnRefRawExpr *>(col_expr)))) {
       }
@@ -512,6 +532,8 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("fail to get table schema", KPC(table_item), K(table_schema));
     } else if (OB_FAIL(table_schema->has_before_update_row_trigger(*schema_guard, trigger_exist))) {
+    } else if (OB_FALSE_IT(trigger_exist = trigger_exist && !(AIColumnService::is_result_publication()
+                   && !session_info_->is_user_session()))) {
     } else if (OB_FAIL(generate_wrapper_expr_for_assignemnts(assigns.at(i).assignments_, trigger_exist))) {
     } else if (OB_FAIL(check_update_vector_col_with_vector_index(table_schema,
                                                                  schema_guard,
@@ -1362,6 +1384,9 @@ int ObDelUpdResolver::add_all_partition_key_columns_to_stmt(const TableItem &tab
 int ObDelUpdResolver::check_need_fired_trigger(const TableItem* table_item)
 {
   int ret = OB_SUCCESS;
+  if (AIColumnService::is_result_publication() && !session_info_->is_user_session()) {
+    return ret;
+  }
   bool has = false;
   const ObTableSchema *table_schema = NULL;
   ObSchemaGetterGuard *schema_guard = NULL;
@@ -2171,6 +2196,23 @@ int ObDelUpdResolver::resolve_insert_columns(const ParseNode *node,
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "specify __sess_create_time value");
       } else if (OB_FAIL(mock_values_column_ref(column_expr))) {
+      }
+      if (OB_SUCC(ret) && column_expr != nullptr
+          && !(AIColumnService::is_worker_write() && !session_info_->is_user_session())) {
+        const ColumnItem *item = del_upd_stmt->get_column_item_by_id(column_expr->get_table_id(), column_expr->get_column_id());
+        const uint64_t table_id = item != nullptr && item->base_tid_ != OB_INVALID_ID
+            ? item->base_tid_ : table_item->is_basic_table() ? table_item->ref_id_ : OB_INVALID_ID;
+        const uint64_t column_id = item != nullptr && item->base_cid_ != OB_INVALID_ID
+            ? item->base_cid_ : column_expr->get_column_id();
+        const ObColumnSchemaV2 *schema = nullptr;
+        if (table_id != OB_INVALID_ID) {
+          if (OB_FAIL(schema_checker_->get_column_schema(table_id, column_id, schema, true))) {
+          } else if (schema != nullptr && (schema->is_ai_column()
+                     || (schema->is_hidden() && schema->get_column_name_str().prefix_match("__ai_")))) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "explicitly inserting an AI result column");
+          }
+        }
       }
     }//end for
   } else {

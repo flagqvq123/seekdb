@@ -20,6 +20,7 @@
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "share/ob_server_struct.h"
 #include "sql/engine/cmd/ob_table_executor.h"
+#include "sql/engine/expr/ob_expr_ai/ai_column_service.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/command/ob_root_service_serialization.h"
 #include "query/runtime/ob_query_runtime_environment.h"
@@ -492,6 +493,24 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
       if (OB_FAIL(execute_ctas(ctx, stmt))){
       }
     }
+    bool has_ai_columns = false;
+    for (auto it = table_schema.column_begin(); !has_ai_columns && it != table_schema.column_end(); ++it) {
+      has_ai_columns = (*it)->is_ai_column();
+    }
+    if (OB_SUCC(ret) && has_ai_columns && res.table_id_ != OB_INVALID_ID && !res.do_nothing_) {
+      ret = AIColumnService::install(ctx, res.table_id_);
+      if (OB_FAIL(ret)) {
+        const int install_ret = ret;
+        obcall::ObDropTableArg drop;
+        obcall::ObTableItem item;
+        if (OB_SUCCESS == prepare_drop_arg(stmt, my_session, item, drop)) {
+          obcall::ObDDLRes dropped;
+          const int drop_ret = query::serialize_root_service_call([&]{ return ctx.root_command_service().drop_table(drop, dropped); });
+          if (drop_ret == OB_SUCCESS) { IGNORE_RETURN(AIColumnService::remove_definition(res.table_id_)); }
+        }
+        ret = install_ret;
+      }
+    }
     SERVER_EVENT_ADD("ddl", "create table execute finish",
       "ret", ret,
       "trace_id", *ObCurTraceId::get_trace_id(),
@@ -754,6 +773,10 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
+  if (stmt.is_ai_retry()) {
+    return AIColumnService::retry(ctx, stmt.get_alter_table_arg().alter_table_schema_.get_table_id(),
+        stmt.get_ai_retry_column_id(), stmt.get_ai_retry_predicate());
+  }
   ObSqlExecutorCtx *task_exec_ctx = NULL;
   obcall::ObAlterTableArg &alter_table_arg = stmt.get_alter_table_arg();
   obcall::ObExchangePartitionArg &exchange_partition_arg = stmt.get_exchange_partition_arg();
@@ -866,6 +889,9 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
             *ctx.get_query_runtime_environment(), ctx.local_command_service(), is_support_cancel))) {
         }
       }
+    }
+    if (OB_SUCC(ret)) {
+      ret = AIColumnService::install(ctx, alter_table_arg.alter_table_schema_.get_table_id());
     }
     char table_info_buffer[256];
     snprintf(table_info_buffer, sizeof(table_info_buffer), "table_id:%ld, hidden_table_id:%ld", 
@@ -1526,6 +1552,7 @@ ObDropTableExecutor::~ObDropTableExecutor()
 int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 4> ai_table_ids;
   ObSqlExecutorCtx *task_exec_ctx = NULL;
   const obcall::ObDropTableArg &drop_table_arg = stmt.get_drop_table_arg();
   obcall::ObDropTableArg &tmp_arg = const_cast<obcall::ObDropTableArg&>(drop_table_arg);
@@ -1534,6 +1561,20 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
   int64_t foreign_key_checks = 0;
   
   const ObTableType table_type = drop_table_arg.table_type_;
+  if (ctx.get_sql_ctx() != nullptr && ctx.get_sql_ctx()->schema_guard_ != nullptr) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < drop_table_arg.tables_.count(); ++i) {
+      const ObTableSchema *schema = nullptr;
+      const obcall::ObTableItem &item = drop_table_arg.tables_.at(i);
+      const int lookup = ctx.get_sql_ctx()->schema_guard_->get_table_schema(item.database_name_, item.table_name_, false, schema);
+      if (lookup == OB_SUCCESS && schema != nullptr) {
+        bool has_ai = false;
+        for (auto it = schema->column_begin(); !has_ai && it != schema->column_end(); ++it) {
+          has_ai = (*it)->is_ai_column();
+        }
+        if (has_ai) { ret = ai_table_ids.push_back(schema->get_table_id()); }
+      }
+    }
+  }
   if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
   } else {
     int64_t affected_rows = 0;
@@ -1605,6 +1646,9 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
     }    
   }
 
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_table_ids.count(); ++i) {
+    ret = AIColumnService::remove_definition(ai_table_ids.at(i));
+  }
   return ret;
 }
 

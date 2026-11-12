@@ -1,0 +1,53 @@
+connection default;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py start 19127
+--disable_warnings
+drop table if exists ai_column_trigger_regression;
+--enable_warnings
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_trigger_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ai_trigger_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('ai_trigger_model', '{"type":"completion","model_name":"mock"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ai_trigger_ep', '{"ai_model_name":"ai_trigger_model","provider":"openai","access_key":"test","url":"http://127.0.0.1:19127/v1/chat/completions"}');
+create table ai_column_trigger_regression(
+  id int primary key,
+  title varchar(100),
+  body varchar(200),
+  result varchar(400) AI COLUMN(AI_COMPLETE('ai_trigger_model',body)) WITH(max_retries=0)
+);
+--error 1235
+create trigger ai_illegal_result before insert on ai_column_trigger_regression
+for each row set NEW.result='forged';
+--error 1235
+create trigger __ai_forged before insert on ai_column_trigger_regression
+for each row set NEW.body='forged';
+create trigger ai_user_dependency before update on ai_column_trigger_regression
+for each row set NEW.body=concat(NEW.body,'-trigger');
+insert into ai_column_trigger_regression(id,title,body) values(1,'initial','body');
+let $retry=100;
+let $ready=0;
+while ($retry)
+{
+  let $ready=`select result is not null from ai_column_trigger_regression where id=1`;
+  if ($ready == 1) { let $retry=0; }
+  if ($ready == 0) { --real_sleep 0.1
+    dec $retry; }
+}
+select body='body' and result='mock:body' as worker_does_not_fire_user_trigger
+from ai_column_trigger_regression where id=1;
+update ai_column_trigger_regression set title='changed' where id=1;
+let $retry=100;
+let $ready=0;
+while ($retry)
+{
+  let $ready=`select ifnull(result='mock:body-trigger',0) from ai_column_trigger_regression where id=1`;
+  if ($ready == 1) { let $retry=0; }
+  if ($ready == 0) { --real_sleep 0.1
+    dec $retry; }
+}
+select body='body-trigger' and result='mock:body-trigger' as user_trigger_dependency_recomputed
+from ai_column_trigger_regression where id=1;
+drop table ai_column_trigger_regression;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_trigger_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ai_trigger_model');
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19127

@@ -1,0 +1,82 @@
+# Additional native-plan JOIN, aggregate and export-failure coverage.
+--source mysql_test/test_suite/file_sql/include/copy_file_sql_data.inc
+--disable_query_log
+let $FILE_SQL_DATA_DIR = $OBSERVER_DIR/data_for_mysqltest_file_sql;
+set session enable_file_sql = ON;
+--exec scp -q mysql_test/test_suite/file_sql/regression_data/* $FILE_SQL_HOST:"$FILE_SQL_DATA_DIR/"
+--exec ssh $FILE_SQL_HOST 'base64 -d "$FILE_SQL_DATA_DIR/multigroup.parquet.b64" > "$FILE_SQL_DATA_DIR/multigroup.parquet" && rm -f "$FILE_SQL_DATA_DIR/multigroup.parquet.b64"'
+
+--echo # Parquet V1/V2 pages, Snappy, dictionary values and nullable columns across row groups
+eval select id, name, active, amount, day, created
+       from read_parquet('$FILE_SQL_DATA_DIR/multigroup.parquet') order by amount;
+eval select count(*) as row_count, count(id) as nonnull_ids, count(name) as nonnull_names,
+            sum(amount) as amount_sum, sum(active) as active_count,
+            min(day) as first_day, max(day) as last_day, min(created) as first_created
+       from read_parquet('$FILE_SQL_DATA_DIR/multigroup.parquet');
+eval select count(*) = 6 as count_projection_ok,
+            count(id) = 5 as nullable_integer_ok, count(name) = 5 as nullable_dictionary_ok,
+            sum(amount) = 23.25 as double_values_ok, sum(active) = 3 as boolean_values_ok,
+            min(day) = cast('1970-01-01' as date) as date_values_ok,
+            min(created) = cast('1969-12-31 23:59:59.999999' as datetime(6)) as timestamp_values_ok
+       from read_parquet('$FILE_SQL_DATA_DIR/multigroup.parquet');
+eval select count(*) as metadata_only_count from read_parquet('$FILE_SQL_DATA_DIR/multigroup.parquet');
+
+--echo # JSON strings, integer overflow and invalid dates retain text
+eval select id, flag, nothing, day from read_ndjson('$FILE_SQL_DATA_DIR/type_edges.jsonl') order by id;
+eval describe select * from read_ndjson('$FILE_SQL_DATA_DIR/type_edges.jsonl');
+eval select id, large_integer, day, nothing from read_csv('$FILE_SQL_DATA_DIR/type_edges.csv') order by id;
+eval describe select * from read_csv('$FILE_SQL_DATA_DIR/type_edges.csv');
+
+--echo # Cross-format inner and left joins
+eval select c.id, c.name, j.score
+       from read_csv('$FILE_SQL_DATA_DIR/basic.csv') c
+       left join read_ndjson('$FILE_SQL_DATA_DIR/basic.jsonl') j on c.id = j.id
+      where c.active = true order by c.id;
+eval select count(*) as matches, sum(c.score) as score_sum
+       from read_csv('$FILE_SQL_DATA_DIR/basic.csv') c
+       inner join read_parquet('$FILE_SQL_DATA_DIR/simple.parquet') p on c.id = p.c1;
+eval select count(*) as preserved_rows, count(p.c1) as matched_rows
+       from read_csv('$FILE_SQL_DATA_DIR/basic.csv') c
+       left join read_parquet('$FILE_SQL_DATA_DIR/simple.parquet') p on c.id + 10 = p.c1;
+
+--echo # Aggregate expressions and HAVING
+eval select active, count(*) as rows_in_group, sum(score) as score_sum,
+            min(score) as min_score, max(score) as max_score
+       from read_csv('$FILE_SQL_DATA_DIR/basic.csv')
+      group by active having sum(score) > 90 order by active;
+eval select count(*) as no_matches from glob('$FILE_SQL_DATA_DIR/does-not-exist-*.csv');
+
+--echo # COPY refuses an existing target
+eval copy (select id, name from read_csv('$FILE_SQL_DATA_DIR/basic.csv') order by id)
+       to '$FILE_SQL_DATA_DIR/copy_regression.csv' (format csv, header);
+--error 1086
+eval copy (select id from read_csv('$FILE_SQL_DATA_DIR/basic.csv'))
+       to '$FILE_SQL_DATA_DIR/copy_regression.csv' (format csv, header);
+eval select id, name from read_csv('$FILE_SQL_DATA_DIR/copy_regression.csv') order by id;
+
+--echo # COPY cleans a failed query before publishing the target
+--error 3140,3141
+eval copy (select case when id = 3 then json_extract(concat('invalid', id), char(36))
+                      else json_object('id',id) end as payload
+             from read_csv('$FILE_SQL_DATA_DIR/basic.csv') order by id)
+       to '$FILE_SQL_DATA_DIR/failed_export.csv' (format csv, header);
+eval select count(*) as failed_target_count from glob('$FILE_SQL_DATA_DIR/failed_export.csv');
+
+--echo # COPY table with custom quoting, escaping and NULL text round trips
+--disable_warnings
+drop table if exists file_sql_copy_options;
+--enable_warnings
+create table file_sql_copy_options(id int primary key, payload varchar(100));
+insert into file_sql_copy_options values(1,'a|b~c^d'),(2,''),(3,null),(4,'NULL');
+eval copy file_sql_copy_options to '$FILE_SQL_DATA_DIR/options.csv'
+       (format csv, header, delimiter '|', quote '~', escape '^', nullstr 'NULL');
+eval select id, payload, payload is null as is_null
+       from read_csv('$FILE_SQL_DATA_DIR/options.csv', delimiter='|', quote='~', escape='^', nullstr='NULL')
+      order by id;
+drop table file_sql_copy_options;
+
+set session enable_file_sql = OFF;
+--error 1235
+eval select count(*) from read_csv('$FILE_SQL_DATA_DIR/basic.csv');
+--enable_query_log
+--source mysql_test/test_suite/file_sql/include/remove_file_sql_data.inc

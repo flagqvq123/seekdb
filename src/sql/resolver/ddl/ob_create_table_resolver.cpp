@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_create_table_resolver.h"
+#include "sql/resolver/ddl/ai_column_resolver.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "sql/rewrite/ob_transform_utils.h"
@@ -337,6 +338,10 @@ int ObCreateTableResolver::resolve(const ParseNode &parse_tree)
           }
         }
 
+        if (OB_SUCC(ret)) {
+          ret = AIColumnResolver::finish_table(*params_.expr_factory_, *session_info_, schema_checker_,
+              create_table_stmt->get_create_table_arg().schema_);
+        }
         // !!Attention!! resolve_partition_option should always call after resolve_table_options
         if (OB_SUCC(ret)) {
           ObTableSchema &table_schema = create_table_stmt->get_create_table_arg().schema_;

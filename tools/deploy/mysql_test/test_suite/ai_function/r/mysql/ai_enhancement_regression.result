@@ -1,0 +1,68 @@
+select ai_complete('reg_complete',ai_prompt('{0}/{0}/{1}','中文🙂',ai_prompt('nested {0}',json_array(1,true))));
+ai_complete('reg_complete',ai_prompt('{0}/{0}/{1}','中文🙂',ai_prompt('nested {0}',json_array(1,true))))
+echo:中文🙂/中文🙂/nested [1, true]
+select ai_complete('reg_complete','"quote"\\slash\n') = concat('echo:','"quote"\\slash\n') as escaping_ok;
+escaping_ok
+1
+select ai_complete('reg_complete','hello',json_object('temperature',0.2,'max_tokens',8)) = 'echo:hello' as config_ok;
+config_ok
+1
+drop table if exists ai_complete_longtext_regression;
+create table ai_complete_longtext_regression(content longtext);
+insert into ai_complete_longtext_regression values(repeat('长',100000));
+select ai_complete('reg_complete',content) = concat('echo:',content) as long_completion_ok,
+json_extract(ai_embed('reg_embed',content,3),'$[0]') = 30000 as long_embedding_ok
+from ai_complete_longtext_regression;
+long_completion_ok	long_embedding_ok
+1	1
+drop table ai_complete_longtext_regression;
+select ai_complete('reg_complete','hello',json_object('model','override'));
+ERROR HY000: Incorrect arguments to ai_complete, invalid config or reserved request field
+select ai_complete('reg_complete','hello',json_object('max_tokens',-1));
+ERROR HY000: Incorrect arguments to ai_complete, invalid config or reserved request field
+select ai_embed('reg_embed','hello',0);
+ERROR HY000: Incorrect arguments to ai_embed, dimension parameter must be a positive integer
+select ai_embed('reg_embed','hello',2.5);
+ERROR HY000: Incorrect arguments to ai_embed, dimension parameter must be an integer, not a decimal or float
+drop table if exists ai_embedding_regression;
+create table ai_embedding_regression(id int primary key, content text, dim int);
+insert into ai_embedding_regression values(1,'a',2),(2,null,2),(3,'中文',3),(4,'longer',2);
+select id,json_length(ai_embed('reg_embed',content,dim)) as dimension,
+json_extract(ai_embed('reg_embed',content,dim),'$[0]') as first_element
+from ai_embedding_regression order by id;
+id	dimension	first_element
+1	2	0.1
+2	NULL	NULL
+3	3	0.6
+4	2	0.6
+select id,json_length(ai_embed('reg_embed',content,dim)) as dimension
+from ai_embedding_regression where id > 2 order by id limit 1;
+id	dimension
+3	3
+drop table ai_embedding_regression;
+select ai_rerank('reg_rerank','q',json_array('a','ccc','bb'));
+ai_rerank('reg_rerank','q',json_array('a','ccc','bb'))
+[{"index": 1, "relevance_score": 3.0}, {"index": 2, "relevance_score": 2.0}, {"index": 0, "relevance_score": 1.0}]
+select ai_rerank('reg_rerank','q',json_array('aa','bb','cc'));
+ai_rerank('reg_rerank','q',json_array('aa','bb','cc'))
+[{"index": 0, "relevance_score": 2.0}, {"index": 1, "relevance_score": 2.0}, {"index": 2, "relevance_score": 2.0}]
+select json_extract(ai_rerank('reg_rerank','q',json_array(
+'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','very long q document')),'$[0].index') as global_index;
+global_index
+20
+select ai_embed('reg_embed','hello',3);
+ERROR HY000: unexpected http message: {"data": [{"index": 1, "embedding": [0.5, 0.6, 0.7]}]}
+select ai_embed('reg_embed','hello',3);
+ERROR HY000: unexpected http message: {"data": [{"index": 0, "embedding": ["invalid", 0.6, 0.7]}]}
+select ai_complete('reg_complete','hello',json_object('temperature',0.2,'max_tokens',8)) = 'echo:hello' as ollama_config_ok;
+ollama_config_ok
+1
+select ai_complete('reg_complete','hello') = 'echo:hello' as ollama_without_key_ok;
+ollama_without_key_ok
+1
+select ai_complete('reg_complete','hello');
+ERROR HY000: unexpected http message: {"choices": [{"message": {"content": ""}}]}
+select ai_complete('reg_complete','hello');
+ERROR HY000: unexpected http message
+select ai_complete('reg_complete','hello');
+ERROR 22032: Invalid JSON text.

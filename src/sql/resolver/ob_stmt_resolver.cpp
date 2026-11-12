@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/engine/expr/ob_expr_ai/ai_column_service.h"
 #include "sql/resolver/ob_stmt_resolver.h"
 
 #include "sql/session/ob_sql_session_info.h"
@@ -215,7 +216,8 @@ int ObStmtResolver::get_column_schema(const uint64_t table_id,
     ret = OB_NOT_INIT;
     SQL_RESV_LOG(WARN, "not init", K(ret), KP(schema_checker_), KP(session_info_));
   } else {
-    const bool hidden = get_hidden || session_info_->is_inner();
+    const bool hidden = get_hidden || session_info_->is_inner()
+        || (AIColumnService::is_strict_read_query() && column_name.prefix_match("__ai_"));
 
     // Generated columns added by function-based indexes are hidden but may
     // still be selected through this path.
@@ -239,8 +241,11 @@ int ObStmtResolver::get_column_schema(const uint64_t table_id,
     ret = OB_NOT_INIT;
     SQL_RESV_LOG(WARN, "not init", K(ret), KP(schema_checker_), KP(session_info_));
   } else {
-    const bool hidden = get_hidden || session_info_->is_inner();
+    const bool hidden = get_hidden || session_info_->is_inner() || AIColumnService::is_strict_read_query();
     if (OB_FAIL(schema_checker_->get_column_schema( table_id, column_id, column_schema, hidden, is_link))) {
+    } else if (!get_hidden && !session_info_->is_inner() && AIColumnService::is_strict_read_query()
+               && column_schema->is_hidden() && !column_schema->get_column_name_str().prefix_match("__ai_")) {
+      ret = OB_ERR_BAD_FIELD_ERROR;
     }
   }
   return ret;

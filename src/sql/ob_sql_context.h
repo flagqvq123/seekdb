@@ -595,6 +595,7 @@ public:
   void reset()
   {
     question_marks_count_ = 0;
+    ai_column_read_refs_.reset();
     calculable_items_.reset();
     fetch_cur_time_ = true;
     is_contain_virtual_table_ = false;
@@ -693,6 +694,7 @@ public:
   common::ObSArray<ObPCConstParamInfo, common::ModulePageAllocator, true> all_possible_const_param_constraints_;
   common::ObSArray<ObPCParamEqualInfo, common::ModulePageAllocator, true> all_equal_param_constraints_;
   common::ObSEArray<ObRawExpr*, 4, common::ModulePageAllocator, true> var_init_exprs_;
+  common::ObSEArray<uint64_t, 8, common::ModulePageAllocator, true> ai_column_read_refs_;
   common::ObDList<ObPreCalcExprConstraint> all_pre_calc_constraints_;
   common::ObSArray<ObExprConstraint, common::ModulePageAllocator, true> all_expr_constraints_;
   common::ObSArray<ObPCPrivInfo, common::ModulePageAllocator, true> all_priv_constraints_;

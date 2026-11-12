@@ -1,0 +1,37 @@
+connection default;
+--disable_warnings
+drop table if exists ai_column_validation;
+--enable_warnings
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_validation_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ai_validation_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('ai_validation_model', '{"type":"completion","model_name":"mock"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ai_validation_ep', '{"ai_model_name":"ai_validation_model","provider":"openai","access_key":"test","url":"http://127.0.0.1:19124/v1/chat/completions"}');
+--error 1235
+create table ai_column_validation(id int primary key, body text, summary text AI COLUMN(AI_COMPLETE('ai_validation_model',body)) WITH(sync_mode='sync'));
+--error 1210
+create table ai_column_validation(id int primary key, body text, summary text AI COLUMN(AI_COMPLETE('ai_validation_model',body)) WITH(max_retries=-1));
+--error 1210
+create table ai_column_validation(id int primary key, body text, summary text AI COLUMN(AI_COMPLETE('ai_validation_model',body)) WITH(max_retries=1,max_retries=2));
+--error 1235
+create table ai_column_validation(id int primary key, body text, summary text AI COLUMN(CONCAT(body,'x')));
+--error 1235
+create table ai_column_validation(id int primary key, body text, summary text AI COLUMN(AI_COMPLETE('ai_validation_model',AI_COMPLETE('ai_validation_model',body))));
+--error 1060
+create table ai_column_validation(id int primary key, `__ai_19_state` int, body text,
+  summary text AI COLUMN(AI_COMPLETE('ai_validation_model',body)));
+create table ai_column_validation(id int primary key, body text, summary text AI COLUMN(AI_COMPLETE('ai_validation_model',body)) WITH(max_retries=0));
+--error 1235
+insert into ai_column_validation(id,body,summary) values(1,'body',NULL);
+--error 1235
+update ai_column_validation set summary=NULL;
+--error 1235
+update ai_column_validation set summary=summary;
+select count(*) = 0 as rejected_writes_have_no_rows from ai_column_validation;
+alter table ai_column_validation retry ai column summary where id=999;
+select count(*) = 0 as zero_match_creates_no_task from oceanbase.__all_ai_column_task
+where table_id=(select table_id from oceanbase.__all_table where table_name='ai_column_validation');
+drop table ai_column_validation;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_validation_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ai_validation_model');

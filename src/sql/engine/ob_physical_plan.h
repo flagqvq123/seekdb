@@ -179,6 +179,8 @@ public:
   const ObExprOperatorFactory &get_expr_op_factory() const { return expr_op_factory_; }
 
   int set_field_columns(const common::ColumnsFieldArray &fields);
+  int set_ai_column_read_refs(const common::ObIArray<uint64_t> &refs) { return ai_column_read_refs_.assign(refs); }
+  const common::ObIArray<uint64_t> &get_ai_column_read_refs() const { return ai_column_read_refs_; }
 
   inline const common::ColumnsFieldArray &get_field_columns() const
   {
@@ -408,6 +410,7 @@ private:
 
   //for fill_result_set
   common::ColumnsFieldArray field_columns_;
+  common::ObFixedArray<uint64_t, common::ObIAllocator> ai_column_read_refs_;
   common::ParamsFieldArray param_columns_;
   common::ObFixedArray<share::AutoincParam, common::ObIAllocator> autoinc_params_; //auto-increment param
   share::ObTabletAutoincParam tablet_autoinc_param_;

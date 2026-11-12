@@ -24,6 +24,7 @@
 #include "sql/optimizer/ob_log_update.h"
 #include "sql/das/ob_domain_id.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "sql/engine/expr/ob_expr_ai/ai_column_service.h"
 
 namespace oceanbase
 {
@@ -2224,6 +2225,16 @@ int ObDmlCgService::convert_normal_triggers(ObLogDelUpd &log_op,
                                             uint64_t dml_event)
 {
   int ret = OB_SUCCESS;
+  if (AIColumnService::is_result_publication() || AIColumnService::is_worker_write()) {
+    const bool publication = AIColumnService::is_result_publication();
+    const bool worker = AIColumnService::is_worker_write();
+    const bool user_session = log_op.get_plan()->get_optimizer_context().get_session_info()->is_user_session();
+    LOG_ERROR("AI publication CG diagnostic", K(publication), K(worker), K(user_session), K(dml_info.ref_table_id_));
+  }
+  if (AIColumnService::is_result_publication()
+      && !log_op.get_plan()->get_optimizer_context().get_session_info()->is_user_session()) {
+    return ret;
+  }
   ObLogPlan *log_plan = log_op.get_plan();
   ObSchemaGetterGuard *schema_guard = NULL;
   const ObTableSchema *table_schema = NULL;
@@ -2254,6 +2265,11 @@ int ObDmlCgService::convert_normal_triggers(ObLogDelUpd &log_op,
       } else {
         // if disable trigger, use the previous plan cache, whether trigger is enable ???
         need_fire = trigger_info->has_event(dml_event) && trigger_info->is_enable();
+        if (need_fire && AIColumnService::is_worker_write()
+            && !log_op.get_plan()->get_optimizer_context().get_session_info()->is_user_session()) {
+          const ObString &name = trigger_info->get_trigger_name();
+          need_fire = name.length() >= 5 && ObString(5, name.ptr()).case_compare("__ai_") == 0;
+        }
         if (OB_SUCC(ret) && need_fire) {
           OZ (trigger_infos.push_back(trigger_info));
         }
@@ -2268,6 +2284,20 @@ int ObDmlCgService::convert_normal_triggers(ObLogDelUpd &log_op,
       if (OB_FAIL(action_order_com.get_ret())) {
         ret = common::OB_ERR_UNEXPECTED;
       }
+      bool has_ai_columns = false;
+      for (auto it = table_schema->column_begin(); !has_ai_columns && it != table_schema->column_end(); ++it) {
+        has_ai_columns = (*it)->is_ai_column();
+      }
+      // Invalidation must observe the final NEW row after ordinary BEFORE triggers.
+      ObSEArray<const ObTriggerInfo *, 2> ordered_triggers;
+      for (int pass = 0; OB_SUCC(ret) && pass < 2; ++pass) {
+        for (int64_t i = 0; OB_SUCC(ret) && i < trigger_infos.count(); ++i) {
+          const ObString &name = trigger_infos.at(i)->get_trigger_name();
+          const bool managed = has_ai_columns && name.length() >= 5 && ObString(5, name.ptr()).case_compare("__ai_") == 0;
+          if (managed == (pass == 1)) { ret = ordered_triggers.push_back(trigger_infos.at(i)); }
+        }
+      }
+      if (OB_SUCC(ret)) { ret = trigger_infos.assign(ordered_triggers); }
       OZ (trig_ctdef.trig_col_info_.init(expectd_col_cnt));
       OZ (trig_ctdef.tg_args_.init(trigger_infos.count()));
       for (int64_t i = 0; OB_SUCC(ret) && i < trigger_infos.count(); i++) {
@@ -2313,7 +2343,9 @@ int ObDmlCgService::convert_normal_triggers(ObLogDelUpd &log_op,
         } else if (OB_ISNULL(column_schema = *cs_iter)) {
           ret = OB_ERR_UNEXPECTED;
         } else {
-          is_hidden = column_schema->is_hidden();
+          is_hidden = column_schema->is_hidden()
+              && !column_schema->get_column_name_str().prefix_match("__ai_")
+              && !(has_ai_columns && column_schema->get_rowkey_position() > 0);
           is_gen_col = column_schema->is_generated_column();
           is_gen_col_dep = column_schema->has_generated_column_deps();
           is_update = has_exist_in_array(updated_column_ids, column_schema->get_column_id());

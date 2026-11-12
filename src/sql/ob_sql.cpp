@@ -1197,6 +1197,11 @@ int ObSql::handle_sql_execute(const ObString &sql,
     ret = OB_INVALID_ARGUMENT;
   } else {
     use_plan_cache = session->get_local_ob_enable_plan_cache();
+    bool ai_strict = false;
+    if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ, ai_strict))) {
+    } else if (ai_strict) {
+      use_plan_cache = false;
+    }
   }
 
   ObPlanCacheCtx pc_ctx(sql, mode, allocator, context, ectx);

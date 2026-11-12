@@ -27,14 +27,30 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_sql_config_, file_column_ids_);
 
 int ObFunctionTableOp::inner_open()
 {
   int ret = OB_SUCCESS;
   node_idx_ = 0;
   already_calc_ = false;
-  if (OB_ISNULL(MY_SPEC.value_expr_)) {
+  if (!MY_SPEC.file_sql_config_.empty()) {
+    std::string canonical;
+    std::vector<int64_t> projection;
+    for (int64_t i=0;i<MY_SPEC.file_column_ids_.count();++i) {projection.push_back(MY_SPEC.file_column_ids_.at(i));}
+    if (OB_FAIL(file_config_.decode(MY_SPEC.file_sql_config_))) {
+    } else if (OB_ISNULL(ctx_.get_my_session())) {
+      ret=OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(FileSqlUtils::check_access(*ctx_.get_my_session(),file_config_.path_,canonical,file_config_.format_==FileSqlConfig::GLOB,&file_config_.secure_root_))) {
+    } else if(file_config_.format_!=FileSqlConfig::GLOB && canonical!=file_config_.path_) {
+      ret=OB_INVALID_ARGUMENT;
+    } else if (OB_ISNULL(file_scanner_=new(std::nothrow) FileScanner())) {
+      ret=OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(file_scanner_->open(file_config_,projection))) {
+    } else {
+      next_row_func_=&ObFunctionTableOp::inner_get_next_row_file;
+    }
+  } else if (OB_ISNULL(MY_SPEC.value_expr_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
@@ -48,6 +64,8 @@ int ObFunctionTableOp::inner_rescan()
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObOperator::inner_rescan())) {
+  } else if (file_scanner_!=nullptr) {
+    ret=file_scanner_->rescan();
   } else {
     node_idx_ = 0;
     if (MY_SPEC.has_correlated_expr_) {
@@ -63,6 +81,8 @@ int ObFunctionTableOp::inner_rescan()
 int ObFunctionTableOp::inner_close()
 {
   int ret = OB_SUCCESS;
+  delete file_scanner_;
+  file_scanner_=nullptr;
   node_idx_ = 0;
   row_count_ = 0;
   col_count_ = 0;
@@ -72,7 +92,56 @@ int ObFunctionTableOp::inner_close()
 
 void ObFunctionTableOp::destroy()
 {
+  delete file_scanner_;
+  file_scanner_=nullptr;
+  file_config_.~FileSqlConfig();
+  file_row_.~vector();
   ObOperator::destroy();
+}
+
+int ObFunctionTableOp::inner_get_next_row_file()
+{
+  int ret=OB_SUCCESS;
+  clear_evaluated_flag();
+  if (OB_FAIL(ctx_.check_status())) {
+  } else if (OB_ISNULL(file_scanner_)) {
+    ret=OB_NOT_INIT;
+  } else if (OB_FAIL(file_scanner_->next(file_row_))) {
+  } else {ret=publish_file_row();}
+  return ret;
+}
+int ObFunctionTableOp::publish_file_row()
+{
+  int ret=OB_SUCCESS;
+    for(int64_t i=0;OB_SUCC(ret) && i<MY_SPEC.column_exprs_.count();++i) {
+      int64_t column=MY_SPEC.file_column_ids_.at(i);
+      ObExpr *expr=MY_SPEC.column_exprs_.at(i);
+      ObObj object;
+      if(column<0 || column>=file_row_.size()) {ret=OB_ERR_UNEXPECTED;}
+      else if(OB_FAIL(FileSqlUtils::cell_to_obj(file_row_[column],file_config_.columns_[column].type_,object))) {
+      } else if(ob_is_string_type(object.get_type()) && !object.is_null()) {
+        const ObString text=object.get_string();char *memory=expr->get_str_res_mem(eval_ctx_,text.length());
+        if(memory==nullptr && text.length()!=0) {ret=OB_ALLOCATE_MEMORY_FAILED;}
+        else {if(text.length()) {MEMCPY(memory,text.ptr(),text.length());}expr->locate_datum_for_write(eval_ctx_).set_string(memory,text.length());expr->set_evaluated_projected(eval_ctx_);}
+      } else if(OB_FAIL(expr->locate_datum_for_write(eval_ctx_).from_obj(object,expr->obj_datum_map_))) {
+      } else {expr->set_evaluated_projected(eval_ctx_);}
+    }
+  return ret;
+}
+int ObFunctionTableOp::inner_get_next_batch(int64_t max_row_cnt)
+{
+  if(file_scanner_==nullptr) {return OB_NOT_SUPPORTED;}
+  int ret=OB_SUCCESS;clear_evaluated_flag();brs_.size_=0;brs_.end_=false;
+  int64_t capacity=std::min(max_row_cnt,MY_SPEC.max_batch_size_);
+  brs_.skip_->reset(capacity);
+  ObEvalCtx::BatchInfoScopeGuard guard(eval_ctx_);guard.set_batch_size(capacity);
+  while(OB_SUCC(ret) && brs_.size_<capacity) {
+    if(OB_FAIL(ctx_.check_status())) {
+    } else if(OB_FAIL(file_scanner_->next(file_row_))) {
+      if(ret==OB_ITER_END) {ret=OB_SUCCESS;brs_.end_=true;break;}
+    } else {guard.set_batch_idx(brs_.size_);if(OB_FAIL(publish_file_row())) {}else {++brs_.size_;}}
+  }
+  return ret;
 }
 
 

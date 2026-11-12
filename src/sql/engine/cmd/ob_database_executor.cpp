@@ -16,6 +16,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "share/ob_server_struct.h"
 #include "sql/engine/cmd/ob_database_executor.h"
+#include "sql/engine/expr/ob_expr_ai/ai_column_service.h"
 #include "query/command/ob_root_service_serialization.h"
 #include "query/command/ob_root_command_service.h"
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
@@ -145,7 +146,7 @@ int ObAlterDatabaseExecutor::execute(ObExecContext &ctx, ObAlterDatabaseStmt &st
     "rpc_dst", GCTX.self_addr(),
     "database_info", alter_database_arg.database_schema_.get_database_id(),
     "schema_version", alter_database_arg.database_schema_.get_schema_version());
-  SQL_ENG_LOG(INFO, "finish execute alter database", K(ret), "ddl_event_info", ObDDLEventInfo(GCTX.self_addr()));
+  SQL_ENG_LOG(INFO, "finish execute alter database", K(ret), "ddl_event_info", share::ObDDLEventInfo(GCTX.self_addr()));
   return ret;
 }
 
@@ -162,12 +163,36 @@ ObDropDatabaseExecutor::~ObDropDatabaseExecutor()
 int ObDropDatabaseExecutor::execute(ObExecContext &ctx, ObDropDatabaseStmt &stmt)
 {
   int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 8> ai_table_ids;
   ObSqlExecutorCtx *task_exec_ctx = NULL;
   const obcall::ObDropDatabaseArg &drop_database_arg = stmt.get_drop_database_arg();
   obcall::ObDropDatabaseArg &tmp_arg = const_cast<obcall::ObDropDatabaseArg&>(drop_database_arg);
   ObString first_stmt;
   uint64_t database_id = 0;
-  if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
+  share::schema::ObSchemaGetterGuard guard;
+  if (GCTX.schema_service_ != nullptr && OB_SUCC(GCTX.schema_service_->get_runtime_schema_guard(guard))) {
+    const share::schema::ObDatabaseSchema *database = nullptr;
+    ObSEArray<const share::schema::ObTableSchema *, 8> tables;
+    if (OB_FAIL(guard.get_database_schema(drop_database_arg.database_name_, database))) {
+    } else if (database != nullptr) {
+      database_id = database->get_database_id();
+      if (OB_FAIL(guard.get_table_schemas_in_database(database_id, tables))) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
+          const share::schema::ObTableSchema *table = tables.at(i);
+          bool has_ai = false;
+          if (table != nullptr && !table->is_index_table()) {
+            for (auto it = table->column_begin(); !has_ai && it != table->column_end(); ++it) {
+              has_ai = (*it)->is_ai_column();
+            }
+            if (has_ai) { ret = ai_table_ids.push_back(table->get_table_id()); }
+          }
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
   } else {
     tmp_arg.ddl_stmt_str_ = first_stmt;
   }
@@ -206,12 +231,18 @@ int ObDropDatabaseExecutor::execute(ObExecContext &ctx, ObDropDatabaseStmt &stmt
       ctx.get_physical_plan_ctx()->set_affected_rows(drop_database_res.affected_row_);
     }
   }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_table_ids.count(); ++i) {
+    ret = AIColumnService::remove_definition(ai_table_ids.at(i));
+  }
+  if (OB_FAIL(ret)) {
+    SQL_ENG_LOG(ERROR, "drop database executor failed", K(ret), K(database_id), K(ai_table_ids));
+  }
   SERVER_EVENT_ADD("ddl", "drop database execute finish",
     "ret", ret,
     "trace_id", *ObCurTraceId::get_trace_id(),
     "rpc_dst", GCTX.self_addr(),
     "database_info", database_id);
-  SQL_ENG_LOG(INFO, "finish execute drop database.", K(ret), "ddl_event_info", ObDDLEventInfo(GCTX.self_addr()));
+  SQL_ENG_LOG(INFO, "finish execute drop database.", K(ret), "ddl_event_info", share::ObDDLEventInfo(GCTX.self_addr()));
   return ret;
 }
 
@@ -239,7 +270,7 @@ int ObRecyclebinRestoreDatabaseExecutor::execute(ObExecContext &ctx, ObRecyclebi
       "rpc_dst", GCTX.self_addr(),
       "origin_db_name", restore_database_arg.origin_db_name_,
       "new_db_name", restore_database_arg.new_db_name_);
-  SQL_ENG_LOG(INFO, "finish execute restore database.", K(ret), "ddl_event_info", ObDDLEventInfo(GCTX.self_addr()));
+  SQL_ENG_LOG(INFO, "finish execute restore database.", K(ret), "ddl_event_info", share::ObDDLEventInfo(GCTX.self_addr()));
   return ret;
 }
 
@@ -266,7 +297,7 @@ int ObPurgeDatabaseExecutor::execute(ObExecContext &ctx, ObPurgeDatabaseStmt &st
     "trace_id", *ObCurTraceId::get_trace_id(),
     "rpc_dst", GCTX.self_addr(),
     "database_info", purge_database_arg.db_name_);
-  SQL_ENG_LOG(INFO, "finish purge database.", K(ret), "ddl_event_info", ObDDLEventInfo(GCTX.self_addr()));
+  SQL_ENG_LOG(INFO, "finish purge database.", K(ret), "ddl_event_info", share::ObDDLEventInfo(GCTX.self_addr()));
   return ret;
 }
 

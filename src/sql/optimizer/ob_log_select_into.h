@@ -48,6 +48,7 @@ public:
   {
   }
   virtual ~ObLogSelectInto() {}
+  common::ObString copy_file_config_;
   inline void set_into_type(ObItemType &into_type)
   {
     into_type_ = into_type;

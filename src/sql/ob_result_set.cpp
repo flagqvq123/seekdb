@@ -27,6 +27,7 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/engine/table/ob_table_scan_op.h"
 #include "share/ob_ddl_checksum.h"
+#include "sql/engine/expr/ob_expr_ai/ai_column_service.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -463,6 +464,15 @@ OB_INLINE int ObResultSet::do_open_plan(ObExecContext &ctx)
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(start_stmt())) {
   } else {
+    bool ai_strict = false;
+    if (OB_FAIL(my_session_.get_sys_variable(SYS_VAR_AI_COLUMN_STRICT_READ, ai_strict))) {
+    } else if (ai_strict && my_session_.is_user_session()) {
+      const ObIArray<uint64_t> &refs = physical_plan_->get_ai_column_read_refs();
+      if ((refs.count() % 2) != 0) { ret = OB_ERR_UNEXPECTED; }
+      for (int64_t i = 0; OB_SUCC(ret) && i + 1 < refs.count(); i += 2) {
+        ret = AIColumnService::check_strict_read(ctx, refs.at(i), refs.at(i + 1));
+      }
+    }
     /* Set exec_result_ to the executor's runtime environment for returning data */
     /* execute plan,
      * For local and distributed plans, all jobs except RootJob finish before execute_plan returns.

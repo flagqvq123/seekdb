@@ -1,0 +1,54 @@
+connection default;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py start 19126
+--disable_warnings
+drop table if exists ai_column_definition_regression;
+--enable_warnings
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_definition_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ai_definition_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('ai_definition_model', '{"type":"completion","model_name":"mock"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ai_definition_ep', '{"ai_model_name":"ai_definition_model","provider":"openai","access_key":"test","url":"http://127.0.0.1:19126/v1/chat/completions"}');
+create table ai_column_definition_regression(
+  id int primary key,
+  body varchar(200),
+  result varchar(400) AI COLUMN(AI_COMPLETE('ai_definition_model',body)) WITH(max_retries=0)
+);
+insert into ai_column_definition_regression(id,body) values(1,'slow-old');
+--real_sleep 0.2
+alter table ai_column_definition_regression modify column result varchar(400)
+AI COLUMN(AI_COMPLETE('ai_definition_model',concat('revised:',body))) WITH(max_retries=0);
+let $retry=150;
+let $ready=0;
+while ($retry)
+{
+  let $ready=`select ifnull(result='mock:revised:slow-old',0) from ai_column_definition_regression where id=1`;
+  if ($ready == 1) { let $retry=0; }
+  if ($ready == 0) { --real_sleep 0.1
+    dec $retry; }
+}
+--real_sleep 2
+select result='mock:revised:slow-old' as modified_definition_wins from ai_column_definition_regression where id=1;
+--replace_column 5 <definition_version>
+show ai columns from ai_column_definition_regression;
+alter table ai_column_definition_regression add column tags json
+AI COLUMN(AI_COMPLETE('ai_definition_model',body)) WITH(max_retries=0);
+let $retry=100;
+let $ready=0;
+while ($retry)
+{
+  let $ready=`select tags is not null from ai_column_definition_regression where id=1`;
+  if ($ready == 1) { let $retry=0; }
+  if ($ready == 0) { --real_sleep 0.1
+    dec $retry; }
+}
+select result='mock:revised:slow-old' as existing_column_preserved,
+       json_unquote(json_extract(tags,'$.input'))='slow-old' as added_column_generated
+from ai_column_definition_regression where id=1;
+let $table_id=`select table_id from oceanbase.__all_table where table_name='ai_column_definition_regression'`;
+drop table ai_column_definition_regression;
+eval select count(*)=0 as dropped_definition_removed from oceanbase.__all_ai_column where table_id=$table_id;
+eval select count(*)=0 as dropped_tasks_removed from oceanbase.__all_ai_column_task where table_id=$table_id;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_definition_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ai_definition_model');
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19126

@@ -22,6 +22,7 @@
 #include "sql/pl/ob_pl_package.h"
 #include "sql/pl/ob_pl_build.h"
 #include "share/schema/ob_trigger_info.h"
+#include "sql/engine/expr/ob_expr_ai/ai_column_service.h"
 
 namespace oceanbase
 {
@@ -238,6 +239,12 @@ int ObTriggerResolver::resolve_drop_trigger_stmt(const ParseNode &parse_node,
   OV (OB_NOT_NULL(session_info_));
   OX ();
   OZ (resolve_schema_name(*parse_node.children_[0], trigger_arg.trigger_database_, trigger_arg.trigger_name_));
+  if (OB_SUCC(ret) && trigger_arg.trigger_name_.length() >= 5
+      && ObString(5, trigger_arg.trigger_name_.ptr()).case_compare("__ai_") == 0
+      && !(AIColumnService::is_worker_write() && !session_info_->is_user_session())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "dropping a managed AI column trigger");
+  }
   OV (OB_NOT_NULL(schema_checker_));
   OX (trigger_arg.if_exist_ = parse_node.value_);
   return ret;
@@ -258,6 +265,11 @@ int ObTriggerResolver::resolve_alter_trigger_stmt(const ParseNode &parse_node,
   OV (OB_NOT_NULL(parse_node.children_[1]));  //alter clause.
   OV (OB_NOT_NULL(session_info_) && OB_NOT_NULL(schema_checker_));
   OZ (resolve_schema_name(*parse_node.children_[0], trigger_db_name, trigger_name));
+  if (OB_SUCC(ret) && trigger_name.length() >= 5 && ObString(5, trigger_name.ptr()).case_compare("__ai_") == 0
+      && !(AIColumnService::is_worker_write() && !session_info_->is_user_session())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "altering a managed AI column trigger");
+  }
   OZ (schema_checker_->get_trigger_info( trigger_db_name,
                                         trigger_name, old_tg_info));
   if (OB_SUCC(ret) && OB_ISNULL(old_tg_info)) {
@@ -286,6 +298,11 @@ int ObTriggerResolver::resolve_trigger_source(const ParseNode &parse_node,
   OV (OB_NOT_NULL(parse_node.children_[0]));    // trigger name.
   OV (OB_NOT_NULL(parse_node.children_[1]));    // trigger definition.
   OZ (resolve_schema_name(*parse_node.children_[0], trigger_arg.trigger_database_, trigger_name));
+  if (OB_SUCC(ret) && trigger_name.length() >= 5 && ObString(5, trigger_name.ptr()).case_compare("__ai_") == 0
+      && !(AIColumnService::is_worker_write() && !session_info_->is_user_session())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "the reserved AI column trigger name prefix");
+  }
   OV (OB_NOT_NULL(session_info_));
   OV (OB_NOT_NULL(schema_checker_));
   OZ (trigger_arg.trigger_info_.set_trigger_name(trigger_name), trigger_name);

@@ -1,0 +1,99 @@
+connection default;
+--disable_query_log
+--disable_result_log
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('reg_complete_ep');
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('reg_embed_ep');
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('reg_rerank_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('reg_complete');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('reg_embed');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('reg_rerank');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('reg_complete','{"type":"completion","model_name":"mock"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('reg_embed','{"type":"dense_embedding","model_name":"mock"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('reg_rerank','{"type":"rerank","model_name":"mock"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('reg_complete_ep','{"ai_model_name":"reg_complete","provider":"openai","access_key":"test","url":"http://127.0.0.1:8000/v1/chat/completions"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('reg_embed_ep','{"ai_model_name":"reg_embed","provider":"openai","access_key":"test","url":"http://127.0.0.1:8000/v1/embeddings/shuffle"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('reg_rerank_ep','{"ai_model_name":"reg_rerank","provider":"siliconflow","access_key":"test","url":"http://127.0.0.1:8000/v1/rerank/shuffle"}');
+--enable_result_log
+--enable_query_log
+select ai_complete('reg_complete',ai_prompt('{0}/{0}/{1}','中文🙂',ai_prompt('nested {0}',json_array(1,true))));
+select ai_complete('reg_complete','"quote"\\slash\n') = concat('echo:','"quote"\\slash\n') as escaping_ok;
+select ai_complete('reg_complete','hello',json_object('temperature',0.2,'max_tokens',8)) = 'echo:hello' as config_ok;
+--disable_warnings
+drop table if exists ai_complete_longtext_regression;
+--enable_warnings
+create table ai_complete_longtext_regression(content longtext);
+insert into ai_complete_longtext_regression values(repeat('长',100000));
+select ai_complete('reg_complete',content) = concat('echo:',content) as long_completion_ok,
+       json_extract(ai_embed('reg_embed',content,3),'$[0]') = 30000 as long_embedding_ok
+from ai_complete_longtext_regression;
+drop table ai_complete_longtext_regression;
+--error 1210
+select ai_complete('reg_complete','hello',json_object('model','override'));
+--error 1210
+select ai_complete('reg_complete','hello',json_object('max_tokens',-1));
+--error 1210
+select ai_embed('reg_embed','hello',0);
+--error 1210
+select ai_embed('reg_embed','hello',2.5);
+--disable_warnings
+drop table if exists ai_embedding_regression;
+--enable_warnings
+create table ai_embedding_regression(id int primary key, content text, dim int);
+insert into ai_embedding_regression values(1,'a',2),(2,null,2),(3,'中文',3),(4,'longer',2);
+select id,json_length(ai_embed('reg_embed',content,dim)) as dimension,
+       json_extract(ai_embed('reg_embed',content,dim),'$[0]') as first_element
+from ai_embedding_regression order by id;
+select id,json_length(ai_embed('reg_embed',content,dim)) as dimension
+from ai_embedding_regression where id > 2 order by id limit 1;
+drop table ai_embedding_regression;
+select ai_rerank('reg_rerank','q',json_array('a','ccc','bb'));
+select ai_rerank('reg_rerank','q',json_array('aa','bb','cc'));
+select json_extract(ai_rerank('reg_rerank','q',json_array(
+'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p','q','r','s','t','very long q document')),'$[0].index') as global_index;
+--disable_query_log
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('reg_embed_ep','{"url":"http://127.0.0.1:8000/v1/embeddings/bad-index"}');
+--enable_query_log
+--error 4070
+select ai_embed('reg_embed','hello',3);
+--disable_query_log
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('reg_embed_ep','{"url":"http://127.0.0.1:8000/v1/embeddings/bad-vector"}');
+--enable_query_log
+--error 4070
+select ai_embed('reg_embed','hello',3);
+--disable_query_log
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('reg_complete_ep','{"provider":"Ollama","access_key":"","url":"http://127.0.0.1:8000/api/generate"}');
+--enable_query_log
+select ai_complete('reg_complete','hello',json_object('temperature',0.2,'max_tokens',8)) = 'echo:hello' as ollama_config_ok;
+--disable_query_log
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('reg_complete_ep');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('reg_complete_ep','{"ai_model_name":"reg_complete","provider":"oLlAmA","url":"http://127.0.0.1:8000/api/generate"}');
+--enable_query_log
+select ai_complete('reg_complete','hello') = 'echo:hello' as ollama_without_key_ok;
+--disable_query_log
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('reg_complete_ep','{"provider":"openai","access_key":"test","url":"http://127.0.0.1:8000/v1/chat/completions/empty"}');
+--enable_query_log
+--error 4070
+select ai_complete('reg_complete','hello');
+--disable_query_log
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('reg_complete_ep','{"url":"http://127.0.0.1:8000/v1/chat/completions/root-array"}');
+--enable_query_log
+--error 4070
+select ai_complete('reg_complete','hello');
+--disable_query_log
+call DBMS_AI_SERVICE.ALTER_AI_MODEL_ENDPOINT('reg_complete_ep','{"url":"http://127.0.0.1:8000/v1/chat/completions/malformed"}');
+--enable_query_log
+--error 3140
+select ai_complete('reg_complete','hello');
+--disable_query_log
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('reg_complete_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('reg_embed_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('reg_rerank_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('reg_complete');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('reg_embed');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('reg_rerank');

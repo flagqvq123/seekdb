@@ -1,0 +1,89 @@
+connection default;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py start 19125
+--disable_warnings
+drop table if exists ai_column_transaction_regression;
+--enable_warnings
+--error 0,11112
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_transaction_ep');
+--error 0,11118
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ai_transaction_model');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('ai_transaction_model', '{"type":"completion","model_name":"mock"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ai_transaction_ep', '{"ai_model_name":"ai_transaction_model","provider":"openai","access_key":"test","url":"http://127.0.0.1:19125/v1/chat/completions"}');
+create table ai_column_transaction_regression(
+  id int primary key,
+  body varchar(200),
+  result varchar(400) AI COLUMN(AI_COMPLETE('ai_transaction_model',body)) WITH(max_retries=0),
+  narrow_result varchar(2) AI COLUMN(AI_COMPLETE('ai_transaction_model',body)) WITH(max_retries=0)
+);
+start transaction;
+insert into ai_column_transaction_regression(id,body) values(1,'rollback-value');
+set session ai_column_strict_read=ON;
+select count(*) as uncommitted_ordinary_rows from ai_column_transaction_regression;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select result from ai_column_transaction_regression where id=999;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+update ai_column_transaction_regression set body=body where result is null;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+delete from ai_column_transaction_regression where result is null;
+rollback;
+set session ai_column_strict_read=OFF;
+select count(*)=0 as rollback_has_no_rows from ai_column_transaction_regression;
+--real_sleep 1
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py assert 19125 no-rollback-value
+insert into ai_column_transaction_regression(id,body) values(2,'typed-conversion');
+let $retry=100;
+let $ready=0;
+while ($retry)
+{
+  let $ready=`select result is not null from ai_column_transaction_regression where id=2`;
+  if ($ready == 1) { let $retry=0; }
+  if ($ready == 0) { --real_sleep 0.1
+    dec $retry; }
+}
+select result='mock:typed-conversion' as success_published,
+       narrow_result is null as failed_conversion_hidden
+from ai_column_transaction_regression where id=2;
+set session ai_column_strict_read=ON;
+select result from ai_column_transaction_regression where id=2;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select narrow_result from ai_column_transaction_regression where id=2;
+set session ai_column_strict_read=OFF;
+start transaction;
+update ai_column_transaction_regression set body='new-uncommitted' where id=2;
+set session ai_column_strict_read=ON;
+--replace_regex /table_id=[0-9]+, column_id=[0-9]+/table_id=<table_id>, column_id=<column_id>/
+--error 11120
+select result from ai_column_transaction_regression where id=2;
+rollback;
+select result from ai_column_transaction_regression where id=2;
+set session ai_column_strict_read=OFF;
+drop table ai_column_transaction_regression;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py reset 19125
+call DBMS_AI_SERVICE.CREATE_AI_MODEL('ai_null_model', '{"type":"dense_embedding","model_name":"mock"}');
+call DBMS_AI_SERVICE.CREATE_AI_MODEL_ENDPOINT('ai_null_ep', '{"ai_model_name":"ai_null_model","provider":"openai","access_key":"test","url":"http://127.0.0.1:19125/v1/embeddings"}');
+create table ai_column_null_regression(id int primary key, body varchar(20),
+  emb vector(4) AI COLUMN(AI_EMBED('ai_null_model',body)) WITH(max_retries=0));
+insert into ai_column_null_regression(id,body) values(1,NULL);
+let $retry=100;
+let $tasks=1;
+while ($retry)
+{
+  let $tasks=`select count(*) from oceanbase.__all_ai_column_task`;
+  if ($tasks == 0) { let $retry=0; }
+  if ($tasks != 0) { --real_sleep 0.1
+    dec $retry; }
+}
+set session ai_column_strict_read=ON;
+select emb is null as null_embedding_is_ready from ai_column_null_regression;
+set session ai_column_strict_read=OFF;
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py assert 19125 no-requests
+drop table ai_column_null_regression;
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_null_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ai_null_model');
+call DBMS_AI_SERVICE.DROP_AI_MODEL_ENDPOINT('ai_transaction_ep');
+call DBMS_AI_SERVICE.DROP_AI_MODEL('ai_transaction_model');
+--exec python3 mysql_test/test_suite/ai_column/include/ai_column_mock.py stop 19125
