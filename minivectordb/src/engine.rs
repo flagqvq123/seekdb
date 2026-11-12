@@ -8,33 +8,24 @@ use crate::sql::ast::{ColumnSpec, Expr, SelectItem, Stmt};
 use crate::storage::{DiskStorage, MemStorage, Storage};
 use crate::types::*;
 
-/// Maximum number of bytes of vector payload kept in the in-memory hot cache.
-const VECTOR_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-
-/// Flat row-major cache of one vector column, used by the fast exact TopK path.
-struct VectorCache {
-    dim: usize,
-    ids: Vec<i64>,
-    flat: Vec<f32>,
-    pk_to_idx: HashMap<i64, u32>,
-}
+use crate::table_cache::{TableCache, DEFAULT_CACHE_BUDGET_BYTES};
 
 pub struct Engine {
     storage: Box<dyn Storage>,
-    /// Tables whose vector caches are stale after writes.
+    /// Tables whose hot caches are stale after writes.
     dirty_tables: HashSet<u32>,
-    /// Hot vector column cache keyed by (table id, column index).
-    vec_cache: HashMap<(u32, usize), VectorCache>,
+    /// Hot cache of the most recently queried table.
+    cache: Option<TableCache>,
 }
 
 impl Engine {
     pub fn open(dir: &Path) -> DbResult<Engine> {
         let storage = DiskStorage::open(dir)?;
-        Ok(Engine { storage: Box::new(storage), dirty_tables: HashSet::new(), vec_cache: HashMap::new() })
+        Ok(Engine { storage: Box::new(storage), dirty_tables: HashSet::new(), cache: None })
     }
 
     pub fn open_memory() -> Engine {
-        Engine { storage: Box::new(MemStorage::new()), dirty_tables: HashSet::new(), vec_cache: HashMap::new() }
+        Engine { storage: Box::new(MemStorage::new()), dirty_tables: HashSet::new(), cache: None }
     }
 
     pub fn shutdown(&mut self) -> DbResult<()> {
@@ -331,81 +322,43 @@ impl Engine {
     }
 
 
-    /// Build (or refresh) the flat vector cache for one column.
-    /// Returns false when the column does not fit the memory budget.
-    fn ensure_vector_cache(&mut self, table: &TableDef, col: usize) -> DbResult<bool> {
-        let key = (table.id, col);
+    /// Ensure the hot cache for this table/vector column is fresh.
+    fn ensure_cache(&mut self, table: &TableDef, col: usize) -> DbResult<bool> {
         let dirty = self.dirty_tables.contains(&table.id);
-        let needs_build = dirty || !self.vec_cache.contains_key(&key);
-        if !needs_build {
+        let reusable = match &self.cache {
+            Some(cache) => cache.table_id == table.id && cache.vector_col == col,
+            None => false,
+        };
+        if reusable && !dirty {
             return Ok(true);
         }
-        let dim = match table.columns[col].ty.vector_dim() {
-            Some(d) => d,
-            None => return Ok(false),
+        self.cache = None;
+        match TableCache::build(&*self.storage, table, col, DEFAULT_CACHE_BUDGET_BYTES)? {
+            Some(cache) => {
+                self.cache = Some(cache);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Recognise a simple <column> = <literal> predicate for dictionary lookup.
+    fn simple_equality(filter: &Expr, table: &TableDef) -> Option<(usize, Value)> {
+        let (left, right) = match filter {
+            Expr::Binary { op: crate::sql::ast::BinOp::Eq, left, right } => {
+                (left.as_ref(), right.as_ref())
+            }
+            _ => return None,
         };
-        let mut ids: Vec<i64> = Vec::new();
-        let mut flat: Vec<f32> = Vec::new();
-        let mut overflow = false;
-        {
-            let budget = VECTOR_CACHE_BUDGET_BYTES;
-            self.storage.scan(table.id, &mut |pk, row| {
-                if let Some(Value::Vec(v)) = row.get(col) {
-                    if (flat.len() + v.len()) * 4 > budget {
-                        overflow = true;
-                        return false;
-                    }
-                    ids.push(pk);
-                    flat.extend_from_slice(v);
-                }
-                true
-            })?;
-        }
-        if overflow {
-            self.vec_cache.remove(&key);
-            return Ok(false);
-        }
-        let mut pk_to_idx = HashMap::with_capacity(ids.len());
-        for (i, pk) in ids.iter().enumerate() {
-            pk_to_idx.insert(*pk, i as u32);
-        }
-        self.vec_cache.insert(key, VectorCache { dim, ids, flat, pk_to_idx });
-        Ok(true)
-    }
-
-    fn cache_key(table_id: u32, col: usize) -> (u32, usize) {
-        (table_id, col)
-    }
-
-    /// Exact TopK over the flat cache (optionally restricted to candidate rows).
-    /// Delegates to the tuned flat scanner in fastscan.rs; ordering is
-    /// (distance ascending, pk ascending) and distances keep f64 semantics.
-    fn cache_topk(
-        cache: &VectorCache,
-        query: &[f32],
-        k: usize,
-        candidates: Option<&[u32]>,
-    ) -> Vec<(i64, f64)> {
-        if k == 0 || cache.ids.is_empty() {
-            return Vec::new();
-        }
-        match candidates {
-            Some(cands) => crate::fastscan::scan_topk_indices_f64(
-                &cache.flat,
-                &cache.ids,
-                cache.dim,
-                query,
-                k,
-                cands,
-            ),
-            None => crate::fastscan::scan_topk_f64(
-                &cache.flat,
-                &cache.ids,
-                cache.ids.len(),
-                cache.dim,
-                query,
-                k,
-            ),
+        let (column, literal) = match (left, right) {
+            (Expr::Column(name), Expr::Lit(value)) => (name, value),
+            (Expr::Lit(value), Expr::Column(name)) => (name, value),
+            _ => return None,
+        };
+        let idx = table.column_index(column)?;
+        match literal {
+            Value::Int(_) | Value::Str(_) => Some((idx, literal.clone())),
+            _ => None,
         }
     }
 
@@ -475,51 +428,50 @@ impl Engine {
             _ => return Ok(None),
         };
         crate::vector::validate_dim(&query, dim)?;
-        if !self.ensure_vector_cache(table, col)? {
+        if !self.ensure_cache(table, col)? {
             return Ok(None);
         }
-        let key = Self::cache_key(table.id, col);
         let candidates: Option<Vec<u32>> = match filter {
             None => None,
             Some(cond) => {
-                let cache = match self.vec_cache.get(&key) {
+                let cache = match self.cache.as_ref() {
                     Some(c) => c,
                     None => return Ok(None),
                 };
-                let mut cands: Vec<u32> = Vec::new();
-                let mut error: Option<DbError> = None;
-                {
-                    let pk_to_idx = &cache.pk_to_idx;
-                    let stop_limit = usize::MAX;
-                    self.storage.scan(table.id, &mut |pk, row| {
+                if let Some((eq_col, value)) = Self::simple_equality(cond, table) {
+                    match cache.lookup_eq(eq_col, &value) {
+                        Some(cands) => Some(cands),
+                        None => return Ok(None),
+                    }
+                } else {
+                    let mut cands: Vec<u32> = Vec::new();
+                    for (idx, row) in cache.rows.iter().enumerate() {
                         match exec::eval(cond, table, Some(row)) {
                             Ok(v) => {
                                 if exec::truthy(&v) {
-                                    if let Some(idx) = pk_to_idx.get(&pk) {
-                                        cands.push(*idx);
-                                    }
+                                    cands.push(idx as u32);
                                 }
                             }
                             Err(e) => {
-                                error = Some(e);
-                                return false;
+                                // Cached rows blank the vector column; such a
+                                // predicate must use the streaming slow path.
+                                if e.code == ERR_INVALID_VECTOR || e.code == ERR_COLUMN_NOT_FOUND {
+                                    return Ok(None);
+                                }
+                                return Err(e);
                             }
                         }
-                        cands.len() < stop_limit
-                    })?;
+                    }
+                    Some(cands)
                 }
-                if let Some(e) = error {
-                    return Err(e);
-                }
-                Some(cands)
             }
         };
         let scored = {
-            let cache = match self.vec_cache.get(&key) {
+            let cache = match self.cache.as_ref() {
                 Some(c) => c,
                 None => return Ok(None),
             };
-            Self::cache_topk(cache, &query, limit, candidates.as_deref())
+            cache.topk(&query, limit, candidates.as_deref())
         };
         let mut columns = Vec::with_capacity(items.len());
         for item in items {

@@ -8,6 +8,7 @@ mod exec;
 mod json;
 mod sql;
 mod storage;
+mod table_cache;
 mod types;
 mod vector;
 
